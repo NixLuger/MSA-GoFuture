@@ -1,0 +1,266 @@
+@startuml C2_Replication
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title GoFuture — C2 Replication (Task3). Красным — новое, синим — из Task1/Task2
+
+skinparam defaultFontColor #000000
+skinparam ArrowFontColor #333333
+skinparam ArrowColor #555555
+
+AddElementTag("new",      $bgColor="#FFEBEE", $borderColor="#C62828", $fontColor="#B71C1C")
+AddElementTag("existing", $bgColor="#E3F2FD", $borderColor="#1565C0", $fontColor="#0D47A1")
+AddElementTag("global",   $bgColor="#FFF3E0", $borderColor="#E65100", $fontColor="#BF360C")
+AddElementTag("dr",       $bgColor="#F3E5F5", $borderColor="#6A1B9A", $fontColor="#4A148C")
+
+' ============================================================
+' GLOBAL LAYER
+' ============================================================
+System_Boundary(global_cp, "Global Control Plane (единое состояние во всех регионах)") {
+    Container(apicurio_sync, "Apicurio Sync", "Schema Registry Federation", "Avro-схемы 20 событий. Pull-on-start + webhook", $tags="global")
+    Container(unleash_fed,   "Unleash Federation", "Feature Flags", "Canary / kill-switch. Единое состояние", $tags="global")
+    Container(fraud_sync,    "Fraud Rules Sync", "Rules Distribution", "Правила fraud (не скоры). Глобальный ассет", $tags="global")
+    Container(tenant_sync,   "Tenant Config Sync", "Config Service", "Корп-клиенты, квоты, лимиты", $tags="global")
+    Container(identity_dir,  "Global Identity Directory", "user_id -> home_region", "Только маршрутизация, без PII", $tags="global")
+    Container(vault,         "Vault", "Secrets Management", "JWT keys, encryption keys. Sync между регионами", $tags="global")
+}
+
+System_Boundary(global_analytics, "Global Analytics (non-PII only)") {
+    ContainerDb(global_ch, "Global ClickHouse", "Data Warehouse", "Агрегаты из регионов (хэшированные)", $tags="global")
+    Container(ml_train,    "ML Training Cluster", "MLflow / Kubeflow", "Обучение на агрегатах. Деплой в регионы", $tags="global")
+    Container(bi,          "Global BI", "DataLens", "Инвесторские и корп-отчёты", $tags="global")
+}
+
+Rel(global_ch, ml_train, "Данные для обучения", "SQL")
+Rel(global_ch, bi,       "Агрегаты для отчётов", "SQL")
+
+' ============================================================
+' REGION RU
+' ============================================================
+System_Boundary(region_ru, "region-ru (152-ФЗ) — PII только в РФ") {
+
+    System_Boundary(ru_edge, "Regional Edge & Security — зона 1") {
+        Container(ru_edge_chain, "DNS -> WAF -> DDoS -> Firewall -> GLB", "Cloudflare + Network Firewall + L7 GLB", "GeoDNS, OWASP Top-10, L3-L7 AntiDDoS, mTLS, health-checked ingress", $tags="new")
+    }
+
+    System_Boundary(ru_z1, "GoFuture Platform — зона 1 (Москва, TIER IV)") {
+        Container(ru_platform, "GoFuture Platform", "C2 Final из Task2", "BFF, 10 сервисов, БД, Kafka, Flink, ML, ClickHouse, Observability", $tags="existing")
+        ContainerDb(ru_pg, "PostgreSQL (primary)", "Transactional DBs", "Booking, Payments, Payouts, Driver, Identity, Tenant", $tags="existing")
+        Container(ru_kafka, "Kafka Cluster (изолированный)", "180 топиков", "36 events + 36 DLQ + 108 retry. RF=3, acks=all", $tags="existing")
+        ContainerDb(ru_ch, "ClickHouse (regional)", "Analytics", "Региональные агрегаты", $tags="existing")
+    }
+
+    System_Boundary(ru_z2, "GoFuture Platform — зона 2 (СПб, DR)") {
+        ContainerDb(ru_pg_rep,       "PostgreSQL (replica)", "Streaming replica", "Async replication, RPO <= 15 мин (финансы)", $tags="dr")
+        Container(ru_keycloak_rep,   "Keycloak (replica)", "OIDC", "Read-replica + backup", $tags="dr")
+        ContainerDb(ru_ch_rep,       "ClickHouse (backup)", "Backup", "Backup + restore", $tags="dr")
+        Container(ru_obj_rep,        "Object Storage (replica)", "S3-compatible", "KYC, media. Cross-city replication", $tags="dr")
+        Container(ru_failover,       "Failover Orchestrator", "Automation", "Health -> promote replica -> DNS switch. RTO <= 45 мин", $tags="new")
+    }
+
+    System_Boundary(ru_ext, "Regional Externals (RU)") {
+        System_Ext(ru_pay,  "Yandex Pay", "Платёжный шлюз RU", $tags="existing")
+        System_Ext(ru_maps, "Yandex Maps", "Карты RU", $tags="existing")
+        System_Ext(ru_bank, "Bank API (RU)", "Выплаты водителям", $tags="existing")
+    }
+}
+
+Rel(ru_edge_chain, ru_platform, "Ingress (health-checked)", "HTTPS")
+
+Rel(ru_pg,            ru_pg_rep,       "Streaming replication (async)", "PostgreSQL protocol")
+Rel(ru_platform,      ru_keycloak_rep, "Keycloak realm sync", "HTTPS")
+Rel(ru_ch,            ru_ch_rep,       "Backup / restore", "S3")
+Rel(ru_platform,      ru_obj_rep,      "Object replication (KYC, media)", "S3")
+Rel(ru_pg,            ru_failover,     "Health check", "SQL")
+Rel(ru_failover,      ru_pg_rep,       "Promote replica", "SQL")
+Rel(ru_failover,      ru_edge_chain,   "DNS switch (failover)", "API")
+
+Rel(ru_platform, apicurio_sync, "Pull schemas on start", "HTTPS")
+Rel(ru_platform, unleash_fed,   "Pull flags", "HTTPS")
+Rel(ru_platform, fraud_sync,    "Pull fraud rules", "HTTPS")
+Rel(ru_platform, tenant_sync,   "Pull tenant configs", "HTTPS")
+Rel(ru_platform, identity_dir,  "Resolve home_region (roaming)", "HTTPS")
+Rel(ru_platform, vault,         "Secrets sync", "HTTPS")
+
+Rel(ru_ch, global_ch, "Aggregates (hashed, non-PII)", "Batch / S3")
+Rel(ml_train, ru_platform, "Deploy model artifact", "HTTPS / S3")
+
+Rel(ru_platform, ru_pay,  "Платежи", "HTTPS")
+Rel(ru_platform, ru_maps, "Геокодирование", "HTTPS")
+Rel(ru_platform, ru_bank, "Выплаты", "HTTPS")
+
+' ============================================================
+' REGION SEA
+' ============================================================
+System_Boundary(region_sea, "region-sea (PDPA SG + PDPA ID) — PII только в Сингапуре") {
+
+    System_Boundary(sea_edge, "Regional Edge & Security — зона 1") {
+        Container(sea_edge_chain, "DNS -> WAF -> DDoS -> Firewall -> GLB", "Cloudflare + Network Firewall + L7 GLB", "GeoDNS, OWASP Top-10, L3-L7, mTLS", $tags="new")
+    }
+
+    System_Boundary(sea_z1, "GoFuture Platform — зона 1 (Сингапур, TIER IV)") {
+        Container(sea_platform, "GoFuture Platform", "C2 Final из Task2", "BFF, 10 сервисов, БД, Kafka, Flink, ML, ClickHouse", $tags="existing")
+        ContainerDb(sea_pg, "PostgreSQL (primary, PII)", "Transactional DBs", "PII только здесь. Cross-border запрещён", $tags="existing")
+        Container(sea_kafka, "Kafka Cluster (изолированный)", "180 топиков", "Регион самодостаточен", $tags="existing")
+        ContainerDb(sea_ch, "ClickHouse (regional)", "Analytics", "Региональные агрегаты", $tags="existing")
+    }
+
+    System_Boundary(sea_z2, "GoFuture Platform — зона 2 (Батам, ЧАСТИЧНЫЙ DR)") {
+        Container(sea_nonpii,      "Non-PII Standby", "Configs / aggregates / outbox / models / images", "Только non-PII. PII не покидает Сингапур (PDPA SG + ID)", $tags="dr")
+        ContainerDb(sea_ch_rep,    "ClickHouse (backup)", "Backup", "Агрегаты", $tags="dr")
+        Container(sea_obj_rep,     "Object Storage (replica)", "S3-compatible", "Non-PII: образы, модели, конфиги", $tags="dr")
+        Container(sea_failover,    "Failover Orchestrator", "Automation", "Восстановление non-PII. PII-потеря = принятый риск", $tags="new")
+    }
+
+    System_Boundary(sea_ext, "Regional Externals (SEA)") {
+        System_Ext(sea_pay,  "GrabPay / Xendit / Stripe", "Платёжный шлюз SEA", $tags="new")
+        System_Ext(sea_maps, "Google Maps / Here", "Карты SEA", $tags="new")
+        System_Ext(sea_bank, "DBS / OCBC", "Выплаты водителям SEA", $tags="new")
+    }
+}
+
+Rel(sea_edge_chain, sea_platform, "Ingress (health-checked)", "HTTPS")
+
+Rel(sea_platform, sea_nonpii,  "Non-PII replication only (outbox, aggregates, configs, schemas, models)", "HTTPS / S3")
+Rel(sea_ch,       sea_ch_rep,  "Aggregates backup", "S3")
+Rel(sea_platform, sea_obj_rep, "Non-PII object replication", "S3")
+Rel(sea_platform, sea_failover, "Health check", "HTTPS")
+Rel(sea_failover, sea_nonpii,  "Restore non-PII", "HTTPS")
+Rel(sea_failover, sea_edge_chain, "DNS switch (partial DR)", "API")
+
+Rel(sea_platform, apicurio_sync, "Pull schemas on start", "HTTPS")
+Rel(sea_platform, unleash_fed,   "Pull flags", "HTTPS")
+Rel(sea_platform, fraud_sync,    "Pull fraud rules", "HTTPS")
+Rel(sea_platform, tenant_sync,   "Pull tenant configs", "HTTPS")
+Rel(sea_platform, identity_dir,  "Resolve home_region (roaming)", "HTTPS")
+Rel(sea_platform, vault,         "Secrets sync", "HTTPS")
+
+Rel(sea_ch, global_ch, "Aggregates (hashed, non-PII)", "Batch / S3")
+Rel(ml_train, sea_platform, "Deploy model artifact", "HTTPS / S3")
+
+Rel(sea_platform, sea_pay,  "Платежи", "HTTPS")
+Rel(sea_platform, sea_maps, "Геокодирование", "HTTPS")
+Rel(sea_platform, sea_bank, "Выплаты", "HTTPS")
+
+' ============================================================
+' REGION LATAM
+' ============================================================
+System_Boundary(region_latam, "region-latam (LGPD) — PII только в Бразилии") {
+
+    System_Boundary(latam_edge, "Regional Edge & Security — зона 1") {
+        Container(latam_edge_chain, "DNS -> WAF -> DDoS -> Firewall -> GLB", "Cloudflare + Network Firewall + L7 GLB", "GeoDNS, OWASP Top-10, L3-L7, mTLS", $tags="new")
+    }
+
+    System_Boundary(latam_z1, "GoFuture Platform — зона 1 (Сан-Паулу)") {
+        Container(latam_platform, "GoFuture Platform", "C2 Final из Task2", "BFF, сервисы, БД, Kafka, Flink, ML", $tags="existing")
+        ContainerDb(latam_pg, "PostgreSQL (primary)", "Transactional DBs", "PII в Сан-Паулу", $tags="existing")
+        Container(latam_kafka, "Kafka Cluster (изолированный)", "180 топиков", "Регион самодостаточен", $tags="existing")
+        ContainerDb(latam_ch, "ClickHouse (regional)", "Analytics", "Агрегаты", $tags="existing")
+    }
+
+    System_Boundary(latam_z2, "GoFuture Platform — зона 2 (Рио, DR)") {
+        ContainerDb(latam_pg_rep,     "PostgreSQL (replica)", "Streaming replica", "Async replication", $tags="dr")
+        Container(latam_keycloak_rep, "Keycloak (replica)", "OIDC", "Read-replica", $tags="dr")
+        ContainerDb(latam_ch_rep,     "ClickHouse (backup)", "Backup", "Backup", $tags="dr")
+        Container(latam_obj_rep,      "Object Storage (replica)", "S3-compatible", "KYC, media", $tags="dr")
+        Container(latam_failover,     "Failover Orchestrator", "Automation", "RTO <= 45 мин", $tags="new")
+    }
+
+    System_Boundary(latam_ext, "Regional Externals (LatAm)") {
+        System_Ext(latam_pay,  "Mercado Pago / Pix", "Платёжный шлюз LatAm", $tags="new")
+        System_Ext(latam_maps, "Google Maps", "Карты LatAm", $tags="new")
+        System_Ext(latam_bank, "Itaú / Bradesco", "Выплаты водителям LatAm", $tags="new")
+    }
+}
+
+Rel(latam_edge_chain, latam_platform, "Ingress (health-checked)", "HTTPS")
+
+Rel(latam_pg,            latam_pg_rep,       "Streaming replication (async)", "PostgreSQL protocol")
+Rel(latam_platform,      latam_keycloak_rep, "Keycloak realm sync", "HTTPS")
+Rel(latam_ch,            latam_ch_rep,       "Backup / restore", "S3")
+Rel(latam_platform,      latam_obj_rep,      "Object replication", "S3")
+Rel(latam_pg,            latam_failover,     "Health check", "SQL")
+Rel(latam_failover,      latam_pg_rep,       "Promote replica", "SQL")
+Rel(latam_failover,      latam_edge_chain,   "DNS switch", "API")
+
+Rel(latam_platform, apicurio_sync, "Pull schemas on start", "HTTPS")
+Rel(latam_platform, unleash_fed,   "Pull flags", "HTTPS")
+Rel(latam_platform, fraud_sync,    "Pull fraud rules", "HTTPS")
+Rel(latam_platform, tenant_sync,   "Pull tenant configs", "HTTPS")
+Rel(latam_platform, identity_dir,  "Resolve home_region (roaming)", "HTTPS")
+Rel(latam_platform, vault,         "Secrets sync", "HTTPS")
+
+Rel(latam_ch, global_ch, "Aggregates (hashed, non-PII)", "Batch / S3")
+Rel(ml_train, latam_platform, "Deploy model artifact", "HTTPS / S3")
+
+Rel(latam_platform, latam_pay,  "Платежи", "HTTPS")
+Rel(latam_platform, latam_maps, "Геокодирование", "HTTPS")
+Rel(latam_platform, latam_bank, "Выплаты", "HTTPS")
+
+' ============================================================
+' REGION MENA
+' ============================================================
+System_Boundary(region_mena, "region-mena (UAE DP) — PII только в ОАЭ") {
+
+    System_Boundary(mena_edge, "Regional Edge & Security — зона 1") {
+        Container(mena_edge_chain, "DNS -> WAF -> DDoS -> Firewall -> GLB", "Cloudflare + Network Firewall + L7 GLB", "GeoDNS, OWASP Top-10, L3-L7, mTLS", $tags="new")
+    }
+
+    System_Boundary(mena_z1, "GoFuture Platform — зона 1 (Дубай)") {
+        Container(mena_platform, "GoFuture Platform", "C2 Final из Task2", "BFF, сервисы, БД, Kafka, Flink", $tags="existing")
+        ContainerDb(mena_pg, "PostgreSQL (primary)", "Transactional DBs", "PII в Дубае", $tags="existing")
+        Container(mena_kafka, "Kafka Cluster (изолированный)", "180 топиков", "Регион самодостаточен", $tags="existing")
+        ContainerDb(mena_ch, "ClickHouse (regional)", "Analytics", "Агрегаты", $tags="existing")
+    }
+
+    System_Boundary(mena_z2, "GoFuture Platform — зона 2 (Абу-Даби, DR)") {
+        ContainerDb(mena_pg_rep,     "PostgreSQL (replica)", "Streaming replica", "Async replication", $tags="dr")
+        Container(mena_keycloak_rep, "Keycloak (replica)", "OIDC", "Read-replica", $tags="dr")
+        ContainerDb(mena_ch_rep,     "ClickHouse (backup)", "Backup", "Backup", $tags="dr")
+        Container(mena_obj_rep,      "Object Storage (replica)", "S3-compatible", "KYC, media", $tags="dr")
+        Container(mena_failover,     "Failover Orchestrator", "Automation", "RTO <= 45 мин", $tags="new")
+    }
+
+    System_Boundary(mena_ext, "Regional Externals (MENA)") {
+        System_Ext(mena_pay,  "Network International / Checkout.com", "Платёжный шлюз MENA", $tags="new")
+        System_Ext(mena_maps, "Google Maps", "Карты MENA", $tags="new")
+        System_Ext(mena_bank, "Emirates NBD", "Выплаты водителям MENA", $tags="new")
+    }
+}
+
+Rel(mena_edge_chain, mena_platform, "Ingress (health-checked)", "HTTPS")
+
+Rel(mena_pg,            mena_pg_rep,       "Streaming replication (async)", "PostgreSQL protocol")
+Rel(mena_platform,      mena_keycloak_rep, "Keycloak realm sync", "HTTPS")
+Rel(mena_ch,            mena_ch_rep,       "Backup / restore", "S3")
+Rel(mena_platform,      mena_obj_rep,      "Object replication", "S3")
+Rel(mena_pg,            mena_failover,     "Health check", "SQL")
+Rel(mena_failover,      mena_pg_rep,       "Promote replica", "SQL")
+Rel(mena_failover,      mena_edge_chain,   "DNS switch", "API")
+
+Rel(mena_platform, apicurio_sync, "Pull schemas on start", "HTTPS")
+Rel(mena_platform, unleash_fed,   "Pull flags", "HTTPS")
+Rel(mena_platform, fraud_sync,    "Pull fraud rules", "HTTPS")
+Rel(mena_platform, tenant_sync,   "Pull tenant configs", "HTTPS")
+Rel(mena_platform, identity_dir,  "Resolve home_region (roaming)", "HTTPS")
+Rel(mena_platform, vault,         "Secrets sync", "HTTPS")
+
+Rel(mena_ch, global_ch, "Aggregates (hashed, non-PII)", "Batch / S3")
+Rel(ml_train, mena_platform, "Deploy model artifact", "HTTPS / S3")
+
+Rel(mena_platform, mena_pay,  "Платежи", "HTTPS")
+Rel(mena_platform, mena_maps, "Геокодирование", "HTTPS")
+Rel(mena_platform, mena_bank, "Выплаты", "HTTPS")
+
+' ============================================================
+' LEGEND
+' ============================================================
+legend right
+  |= Цвет |= Значение |
+  |<#E3F2FD> Существующее | Компоненты из Task1/Task2 (C2 Final, RU-платёжные системы) |
+  |<#FFEBEE> Новое в Task3 | Репликация, DR, Global Control Plane, WAF/Firewall/DDoS/GLB, externals новых регионов |
+  |<#FFF3E0> Global | Global Control Plane и Global Analytics |
+  |<#F3E5F5> DR | DR-реплики во второй зоне |
+  | Стрелка | Репликация / поток данных / ingress |
+endlegend
+
+@enduml

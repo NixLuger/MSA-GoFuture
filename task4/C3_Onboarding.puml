@@ -1,0 +1,134 @@
+@startuml C3_Onboarding
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title GoFuture — C3 Onboarding (Task4). Компоненты onboarding-процесса.
+' Красным — новое в Task4, синим — существующее из Task1–3.
+
+skinparam defaultFontColor #000000
+skinparam ArrowFontColor #333333
+skinparam ArrowColor #555555
+
+AddElementTag("new",      $bgColor="#FFEBEE", $borderColor="#C62828", $fontColor="#B71C1C")
+AddElementTag("existing", $bgColor="#E3F2FD", $borderColor="#1565C0", $fontColor="#0D47A1")
+AddElementTag("global",   $bgColor="#FFF3E0", $borderColor="#E65100", $fontColor="#BF360C")
+AddElementTag("external", $bgColor="#F3E5F5", $borderColor="#6A1B9A", $fontColor="#4A148C")
+
+' ============================================================
+' ACTORS
+' ============================================================
+Person(partner_smb, "Партнёр (SMB)", "Self-service заявка", $tags="existing")
+Person(sales, "Sales / Account Manager", "Enterprise onboarding", $tags="existing")
+Person(approver, "Approver (Legal / Finance)", "Enterprise approval", $tags="existing")
+Person(new_admin, "Первый tenant_admin", "Получает доступ", $tags="existing")
+
+' ============================================================
+' EXTERNAL SYSTEMS
+' ============================================================
+System_Ext(kyc_provider, "KYC Provider", "Per-region (Refinitiv / local)", $tags="external")
+System_Ext(email_gateway, "Email Gateway", "SMTP / SendGrid", $tags="existing")
+
+' ============================================================
+' GOFUTURE PLATFORM — Tenant Management
+' ============================================================
+System_Boundary(tenant_mgmt, "Tenant Management (svc_tenant)") {
+    Component(onboarding_form, "Onboarding Form / API", "REST endpoint", "Приём заявок (self-service) и создание enterprise-заявок (sales)", $tags="existing")
+    Component(onboarding_wf, "Onboarding Workflow", "State machine / Saga orchestrator", "Шаги 1-11, идемпотентность, компенсация, retry", $tags="new")
+    Component(tenant_service, "Tenant Service", "Business logic", "Создание / чтение / обновление тенантов. Квоты, тариф, статус", $tags="existing")
+    ComponentDb(tenant_db, "Tenant DB", "PostgreSQL", "tenants, onboarding_requests, quotas", $tags="existing")
+}
+
+' ============================================================
+' IAM
+' ============================================================
+System_Boundary(iam, "IAM (Keycloak + svc_identity)") {
+    Component(keycloak, "Keycloak", "OIDC Provider (per-region)", "Shared realm gofuture. Groups tenant:<uuid>, roles, users", $tags="existing")
+    Component(identity_svc, "Identity Service", "FastAPI", "Управление пользователями, ролями, сессиями (Keycloak Admin API)", $tags="existing")
+}
+
+' ============================================================
+' NOTIFICATION
+' ============================================================
+System_Boundary(notif, "Notification") {
+    Component(notification_svc, "Notification Service", "FastAPI", "Email / push / webhook. Welcome, инструкции", $tags="existing")
+}
+
+' ============================================================
+' EVENT BUS
+' ============================================================
+System_Boundary(event_bus, "Event Bus (Task2)") {
+    ComponentQueue(kafka, "Kafka", "Apache Kafka (per-region)", "Tenant.Onboarded, User.Registered. Outbox (Task2 ADR-005)", $tags="existing")
+}
+
+' ============================================================
+' GLOBAL CONTROL PLANE (Task3)
+' ============================================================
+System_Boundary(gcp, "Global Control Plane (EU / Frankfurt, Task3 ADR-002)") {
+    Component(tenant_sync, "Tenant Config Sync", "Config Service", "Tenant configs (non-PII): квоты, тариф, home_region", $tags="global")
+}
+
+' ============================================================
+' BILLING
+' ============================================================
+System_Boundary(billing, "Billing") {
+    Component(billing_svc, "Billing Service", "FastAPI (новый в Task4)", "Тарифы, квоты, invoice. SMB — карта, enterprise — invoice", $tags="new")
+}
+
+' ============================================================
+' ADMIN / MONITORING
+' ============================================================
+System_Boundary(admin_mon, "Admin & Observability") {
+    Component(admin_panel, "Admin Panel (BFF Admin)", "React SPA + OIDC", "Управление тенантами (платформенный админ)", $tags="existing")
+    Component(loki, "Loki (audit)", "Log aggregation", "Audit: каждый шаг workflow", $tags="existing")
+}
+
+' ============================================================
+' RELATIONS
+' ============================================================
+
+' Self-service
+Rel(partner_smb, onboarding_form, "Заполняет форму (self-service)", "HTTPS")
+Rel(onboarding_form, onboarding_wf, "Создать onboarding_request", "REST")
+
+' Enterprise
+Rel(sales, onboarding_form, "Создаёт enterprise-заявку", "HTTPS")
+Rel(sales, kyc_provider, "Инициирует KYC", "HTTPS")
+Rel(kyc_provider, onboarding_wf, "KYC result (webhook)", "HTTPS")
+Rel(approver, onboarding_form, "Approval / reject", "HTTPS")
+Rel(sales, admin_panel, "Мониторит onboarding", "HTTPS")
+
+' Core workflow
+Rel(onboarding_wf, tenant_service, "1. Валидация + создать тенант", "REST")
+Rel(tenant_service, tenant_db, "2. INSERT tenant + onboarding_request", "SQL")
+Rel(onboarding_wf, keycloak, "3. Create group tenant:<uuid>", "Admin API")
+Rel(onboarding_wf, keycloak, "4. Create user (tenant_admin)", "Admin API")
+Rel(onboarding_wf, keycloak, "5. Assign role tenant_admin", "Admin API")
+Rel(onboarding_wf, identity_svc, "6. Sync user -> svc_identity", "REST")
+Rel(onboarding_wf, billing_svc, "7. Настроить billing (SMB card / ENT invoice)", "REST")
+Rel(onboarding_wf, notification_svc, "8. Welcome email + set-password link", "REST")
+Rel(notification_svc, email_gateway, "Отправка email", "SMTP")
+Rel(new_admin, keycloak, "Устанавливает пароль (email link)", "HTTPS")
+
+' Events
+Rel(onboarding_wf, kafka, "9. Publish Tenant.Onboarded", "Kafka")
+Rel(kafka, identity_svc, "Consume Tenant.Onboarded", "Kafka")
+Rel(kafka, notification_svc, "Consume Tenant.Onboarded", "Kafka")
+
+' Global config
+Rel(tenant_service, tenant_sync, "10. Publish tenant config (non-PII)", "HTTPS")
+Rel(tenant_sync, tenant_service, "Read-копия (pull)", "HTTPS")
+
+' Audit
+Rel(onboarding_wf, loki, "Audit: каждый шаг", "OTLP / HTTP")
+
+' Legend
+legend right
+  |= Цвет |= Значение |
+  |<#E3F2FD> Существующее | svc_tenant, Keycloak, svc_identity, Notification, Kafka, Admin Panel |
+  |<#FFEBEE> Новое в Task4 | Onboarding Workflow (state machine, Saga), Billing Service |
+  |<#F3E5F5> Внешнее | KYC Provider (per-region) |
+  |<#FFF3E0> Global | Tenant Config Sync (Task3) |
+  | -- | -- |
+  | Нумерация 1-10 | Шаги workflow (см. ADR-003) |
+endlegend
+
+@enduml
