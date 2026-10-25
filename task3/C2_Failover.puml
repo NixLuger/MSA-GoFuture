@@ -1,0 +1,193 @@
+@startuml C2_Failover
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title GoFuture — C2 Failover (Task3). Точки отказа и механизмы переключения.
+' Красным — механизмы failover (новое), синим — существующее.
+
+skinparam defaultFontColor #000000
+skinparam ArrowFontColor #333333
+skinparam ArrowColor #555555
+
+AddElementTag("new",      $bgColor="#FFEBEE", $borderColor="#C62828", $fontColor="#B71C1C")
+AddElementTag("existing", $bgColor="#E3F2FD", $borderColor="#1565C0", $fontColor="#0D47A1")
+AddElementTag("global",   $bgColor="#FFF3E0", $borderColor="#E65100", $fontColor="#BF360C")
+AddElementTag("dr",       $bgColor="#F3E5F5", $borderColor="#6A1B9A", $fontColor="#4A148C")
+AddElementTag("fail",     $bgColor="#FFCDD2", $borderColor="#B71C1C", $fontColor="#B71C1C")
+
+' ============================================================
+' GLOBAL LAYER (EU / Frankfurt) — из ADR-002
+' ============================================================
+System_Boundary(neutral_zone, "Neutral Zone — EU / Frankfurt (из ADR-002)") {
+    Container(gcp_master, "Global Control Plane (master)", "Apicurio / Unleash / Vault / Fraud rules / Tenant configs / Identity dir", "Non-PII. Read-копии во всех регионах", $tags="global")
+    Container(ga_master,  "Global Analytics (master)", "Global ClickHouse / ML training / BI", "Non-PII агрегаты", $tags="global")
+}
+
+' ============================================================
+' REGION RU
+' ============================================================
+System_Boundary(region_ru, "region-ru (152-ФЗ)") {
+
+    System_Boundary(ru_z1, "Зона 1 — Москва (TIER IV)") {
+        Container(ru_glb_pool_1, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        Container(ru_platform_1, "GoFuture Platform", "C2 Final (Task1)", "BFF, сервисы, Kafka, Flink, ClickHouse", $tags="existing")
+        ContainerDb(ru_pg_1, "PostgreSQL (primary)", "Transactional", "Booking, Payments, Payouts, Driver, Identity, Tenant", $tags="existing")
+        Container(ru_keycloak_1, "Keycloak (primary)", "OIDC", "Auth", $tags="existing")
+    }
+
+    System_Boundary(ru_z2, "Зона 2 — СПб (DR)") {
+        Container(ru_glb_pool_2, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        ContainerDb(ru_pg_2, "PostgreSQL (replica)", "Streaming replica", "RPO <= 15 мин (финансы)", $tags="dr")
+        Container(ru_keycloak_2, "Keycloak (replica)", "OIDC", "Read-replica", $tags="dr")
+        ContainerDb(ru_ch_2, "ClickHouse (backup)", "Backup", "Агрегаты", $tags="dr")
+        Container(ru_obj_2, "Object Storage (replica)", "S3-compatible", "KYC, media", $tags="dr")
+        Container(ru_failover, "Failover Orchestrator", "Temporal / K8s operator", "Health aggregate → promote → DNS switch → reconciliation", $tags="new")
+    }
+
+    System_Boundary(ru_fp, "Точки отказа (failure points)") {
+        Container(fp_ru_city, "FP: город Москва", "L2", "Потеря зоны 1", $tags="fail")
+        Container(fp_ru_region, "FP: регион RU", "L3", "Потеря обеих зон", $tags="fail")
+    }
+}
+
+' ============================================================
+' REGION SEA (частичный DR)
+' ============================================================
+System_Boundary(region_sea, "region-sea (PDPA SG + ID) — частичный DR") {
+
+    System_Boundary(sea_z1, "Зона 1 — Сингапур (TIER IV)") {
+        Container(sea_glb_pool_1, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        Container(sea_platform_1, "GoFuture Platform", "C2 Final (Task1)", "BFF, сервисы, Kafka, Flink", $tags="existing")
+        ContainerDb(sea_pg_1, "PostgreSQL (primary, PII)", "Transactional", "PII только здесь", $tags="existing")
+        Container(sea_keycloak_1, "Keycloak (primary)", "OIDC", "Auth", $tags="existing")
+    }
+
+    System_Boundary(sea_z2, "Зона 2 — Батам (non-PII only)") {
+        Container(sea_glb_pool_2, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        Container(sea_nonpii_2, "Non-PII Standby", "Configs / aggregates / outbox / models / images", "PII не покидает Сингапур", $tags="dr")
+        ContainerDb(sea_ch_2, "ClickHouse (backup)", "Backup", "Агрегаты (non-PII)", $tags="dr")
+        Container(sea_obj_2, "Object Storage (replica)", "S3-compatible", "Non-PII: модели, конфиги, образы", $tags="dr")
+        Container(sea_failover, "Failover Orchestrator", "Temporal / K8s operator", "Restore non-PII. PII-потеря = принятый риск", $tags="new")
+    }
+
+    System_Boundary(sea_fp, "Точки отказа") {
+        Container(fp_sea_city, "FP: город Сингапур", "L2", "Потеря PII (принятый риск)", $tags="fail")
+    }
+}
+
+' ============================================================
+' REGION LATAM
+' ============================================================
+System_Boundary(region_latam, "region-latam (LGPD)") {
+
+    System_Boundary(latam_z1, "Зона 1 — Сан-Паулу") {
+        Container(latam_glb_pool_1, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        Container(latam_platform_1, "GoFuture Platform", "C2 Final (Task1)", "BFF, сервисы, Kafka, Flink", $tags="existing")
+        ContainerDb(latam_pg_1, "PostgreSQL (primary)", "Transactional", "PII в Сан-Паулу", $tags="existing")
+        Container(latam_keycloak_1, "Keycloak (primary)", "OIDC", "Auth", $tags="existing")
+    }
+
+    System_Boundary(latam_z2, "Зона 2 — Рио (DR)") {
+        Container(latam_glb_pool_2, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        ContainerDb(latam_pg_2, "PostgreSQL (replica)", "Streaming replica", "RPO <= 15 мин", $tags="dr")
+        Container(latam_keycloak_2, "Keycloak (replica)", "OIDC", "Read-replica", $tags="dr")
+        ContainerDb(latam_ch_2, "ClickHouse (backup)", "Backup", "Агрегаты", $tags="dr")
+        Container(latam_obj_2, "Object Storage (replica)", "S3-compatible", "KYC, media", $tags="dr")
+        Container(latam_failover, "Failover Orchestrator", "Temporal / K8s operator", "Promote → DNS switch → reconciliation", $tags="new")
+    }
+
+    System_Boundary(latam_fp, "Точки отказа") {
+        Container(fp_latam_city, "FP: город Сан-Паулу", "L2", "Потеря зоны 1", $tags="fail")
+    }
+}
+
+' ============================================================
+' REGION MENA
+' ============================================================
+System_Boundary(region_mena, "region-mena (UAE DP)") {
+
+    System_Boundary(mena_z1, "Зона 1 — Дубай") {
+        Container(mena_glb_pool_1, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        Container(mena_platform_1, "GoFuture Platform", "C2 Final (Task1)", "BFF, сервисы, Kafka, Flink", $tags="existing")
+        ContainerDb(mena_pg_1, "PostgreSQL (primary)", "Transactional", "PII в Дубае", $tags="existing")
+        Container(mena_keycloak_1, "Keycloak (primary)", "OIDC", "Auth", $tags="existing")
+    }
+
+    System_Boundary(mena_z2, "Зона 2 — Абу-Даби (DR)") {
+        Container(mena_glb_pool_2, "Regional GLB pool", "L7", "Health-checked ingress", $tags="new")
+        ContainerDb(mena_pg_2, "PostgreSQL (replica)", "Streaming replica", "RPO <= 15 мин", $tags="dr")
+        Container(mena_keycloak_2, "Keycloak (replica)", "OIDC", "Read-replica", $tags="dr")
+        ContainerDb(mena_ch_2, "ClickHouse (backup)", "Backup", "Агрегаты", $tags="dr")
+        Container(mena_obj_2, "Object Storage (replica)", "S3-compatible", "KYC, media", $tags="dr")
+        Container(mena_failover, "Failover Orchestrator", "Temporal / K8s operator", "Promote → DNS switch → reconciliation", $tags="new")
+    }
+
+    System_Boundary(mena_fp, "Точки отказа") {
+        Container(fp_mena_city, "FP: город Дубай", "L2", "Потеря зоны 1", $tags="fail")
+    }
+}
+
+' ============================================================
+' HEALTH CHECKS (GLB → Regional GLB pool)
+' ============================================================
+Rel(ru_glb_pool_1, ru_glb_pool_2, "Health check / failover (10 сек)", "HTTPS")
+Rel(sea_glb_pool_1, sea_glb_pool_2, "Health check / failover (10 сек)", "HTTPS")
+Rel(latam_glb_pool_1, latam_glb_pool_2, "Health check / failover (10 сек)", "HTTPS")
+Rel(mena_glb_pool_1, mena_glb_pool_2, "Health check / failover (10 сек)", "HTTPS")
+
+' ============================================================
+' FAILOVER MECHANISMS (что делает Orchestrator)
+' ============================================================
+Rel(ru_pg_1, ru_pg_2, "Streaming replication (async)", "PostgreSQL protocol")
+Rel(ru_failover, ru_pg_2, "1. Promote replica", "SQL")
+Rel(ru_failover, ru_keycloak_2, "2. Activate replica", "HTTPS")
+Rel(ru_failover, ru_glb_pool_2, "3. DNS switch (failover)", "API")
+Rel(ru_failover, ru_platform_1, "4. Reconciliation: outbox -> Kafka, PSP sync", "HTTPS")
+
+Rel(sea_failover, sea_nonpii_2, "1. Restore non-PII", "HTTPS")
+Rel(sea_failover, sea_glb_pool_2, "2. DNS switch (partial DR)", "API")
+
+Rel(latam_pg_1, latam_pg_2, "Streaming replication (async)", "PostgreSQL protocol")
+Rel(latam_failover, latam_pg_2, "1. Promote replica", "SQL")
+Rel(latam_failover, latam_keycloak_2, "2. Activate replica", "HTTPS")
+Rel(latam_failover, latam_glb_pool_2, "3. DNS switch", "API")
+Rel(latam_failover, latam_platform_1, "4. Reconciliation", "HTTPS")
+
+Rel(mena_pg_1, mena_pg_2, "Streaming replication (async)", "PostgreSQL protocol")
+Rel(mena_failover, mena_pg_2, "1. Promote replica", "SQL")
+Rel(mena_failover, mena_keycloak_2, "2. Activate replica", "HTTPS")
+Rel(mena_failover, mena_glb_pool_2, "3. DNS switch", "API")
+Rel(mena_failover, mena_platform_1, "4. Reconciliation", "HTTPS")
+
+' ============================================================
+' GLOBAL CONTROL PLANE — read-копии в регионах
+' ============================================================
+Rel(gcp_master, ru_platform_1, "Read-копия (pull + webhook)", "HTTPS")
+Rel(gcp_master, sea_platform_1, "Read-копия (pull + webhook)", "HTTPS")
+Rel(gcp_master, latam_platform_1, "Read-копия (pull + webhook)", "HTTPS")
+Rel(gcp_master, mena_platform_1, "Read-копия (pull + webhook)", "HTTPS")
+
+Rel(ga_master, ru_platform_1, "Aggregates from region (batch)", "S3")
+Rel(ga_master, sea_platform_1, "Aggregates from region (batch)", "S3")
+
+' ============================================================
+' CROSS-REGION: degraded mode / roaming (при потере региона)
+' ============================================================
+Rel(sea_glb_pool_1, mena_glb_pool_1, "Traffic re-route (L3 failover)", "HTTPS")
+Rel(mena_glb_pool_1, latam_glb_pool_1, "Traffic re-route (пример)", "HTTPS")
+Rel(sea_platform_1, ru_platform_1, "Roaming API call (при L3 failover)", "HTTPS")
+
+' ============================================================
+' LEGEND
+' ============================================================
+legend right
+  |= Цвет |= Значение |
+  |<#E3F2FD> Существующее | Из Task1/Task2: GoFuture Platform, PG primary, Keycloak primary |
+  |<#F3E5F5> DR | DR-реплики во второй зоне |
+  |<#FFEBEE> Новое в Task3 | Failover Orchestrator, Regional GLB pool, health checks |
+  |<#FFCDD2> Точка отказа | Failure point (город / регион) |
+  |<#FFF3E0> Global | Global Control Plane / Analytics (EU) |
+  | -- | -- |
+  | 1..4 | Шаги failover: promote replica -> Keycloak -> DNS -> reconciliation |
+endlegend
+
+@enduml

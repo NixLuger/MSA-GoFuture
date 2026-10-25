@@ -1,0 +1,254 @@
+@startuml C2_MultiTenant
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title GoFuture — C2 Multi-Tenant Platform (Task4). IAM + Monitoring + Onboarding.
+' Красным — новое в Task4, синим — существующее из Task1–3.
+
+skinparam defaultFontColor #000000
+skinparam ArrowFontColor #333333
+skinparam ArrowColor #555555
+
+AddElementTag("new",      $bgColor="#FFEBEE", $borderColor="#C62828", $fontColor="#B71C1C")
+AddElementTag("existing", $bgColor="#E3F2FD", $borderColor="#1565C0", $fontColor="#0D47A1")
+AddElementTag("global",   $bgColor="#FFF3E0", $borderColor="#E65100", $fontColor="#BF360C")
+AddElementTag("external", $bgColor="#F3E5F5", $borderColor="#6A1B9A", $fontColor="#4A148C")
+AddElementTag("monitor",  $bgColor="#E8F5E9", $borderColor="#2E7D32", $fontColor="#1B5E20")
+
+' ============================================================
+' ACTORS
+' ============================================================
+Person(passenger, "Пассажир", "Заказывает поездки", $tags="existing")
+Person(driver,    "Водитель",  "Выполняет поездки", $tags="existing")
+Person(manager,   "Корп-менеджер / Tenant Admin", "Управляет корп-поездками", $tags="existing")
+Person(accountant,"Бухгалтер", "Контролирует выплаты", $tags="existing")
+Person(platform_admin, "Platform Admin", "Управляет платформой и тенантами", $tags="existing")
+Person(partner,   "Партнёр (новый тенант)", "Onboarding", $tags="existing")
+
+' ============================================================
+' EDGE LAYER (Task3)
+' ============================================================
+System_Boundary(edge, "Edge Layer (Task3)") {
+    Container(edge_chain, "WAF + DDoS + GLB + GeoDNS", "Cloudflare / AntiDDoS", "Ingress, защита, геомаршрутизация", $tags="existing")
+    Container(kong, "Regional Ingress (Kong)", "Kong (Task1)", "JWT validation, mTLS, rate limiting per tenant_id", $tags="existing")
+}
+
+' ============================================================
+' BFF LAYER (Task1) + tenant-aware middleware (Task4)
+' ============================================================
+System_Boundary(bff_layer, "BFF Layer (Task1) + tenant-aware (Task4)") {
+    Container(bff_passenger, "BFF Passenger", "FastAPI", "Агрегация для пассажира", $tags="existing")
+    Container(bff_driver,    "BFF Driver", "FastAPI", "Агрегация для водителя", $tags="existing")
+    Container(bff_corp,      "BFF Corporate", "FastAPI", "Агрегация для корп-портала", $tags="existing")
+    Container(bff_admin,     "BFF Admin", "FastAPI", "Агрегация для админки", $tags="existing")
+    Container(bff_web,       "BFF Web", "FastAPI", "Агрегация для веб-фронта", $tags="existing")
+    Container(tenant_mw,     "Tenant-aware Middleware", "Библиотека (в BFF)", "Извлекает tenant_id из JWT, добавляет в metrics / logs / traces, считает API calls", $tags="new")
+    Container(rbac_mw,       "RBAC Middleware", "Библиотека (в BFF)", "Scope check (ADR-002 Task4)", $tags="new")
+}
+
+' ============================================================
+' BUSINESS SERVICES (Task1)
+' ============================================================
+System_Boundary(business, "Business Services (Task1)") {
+    Container(svc_booking, "Booking", "FastAPI", "Жизненный цикл поездки", $tags="existing")
+    Container(svc_driver_profile, "Driver Profile", "FastAPI", "Профиль, KYC водителя", $tags="existing")
+    Container(svc_driver_status, "Driver Status", "FastAPI", "Статус, геопозиция", $tags="existing")
+    Container(svc_pricing, "Pricing", "FastAPI", "Тарифы, динамическое ценообразование", $tags="existing")
+    Container(svc_payments, "Payments", "FastAPI", "Платежи", $tags="existing")
+    Container(svc_payouts, "Payouts", "FastAPI", "Выплаты водителям", $tags="existing")
+    Container(svc_notification, "Notification", "FastAPI", "Push / SMS / email", $tags="existing")
+    Container(svc_geography, "Geography", "FastAPI", "Геопоиск, маршруты", $tags="existing")
+    Container(svc_analytics, "Analytics", "FastAPI", "Операционная аналитика", $tags="existing")
+    Container(svc_fraud, "Fraud", "FastAPI", "Скоринг, ML-детекция", $tags="existing")
+}
+
+' ============================================================
+' PLATFORM SERVICES (Task1 + Task4)
+' ============================================================
+System_Boundary(platform, "Platform Services (Task1 + Task4)") {
+    Container(keycloak, "Keycloak", "OIDC Provider (per-region)", "Shared realm gofuture. JWT: tenant_id, region, roles, scope", $tags="existing")
+    Container(svc_identity, "Identity Service", "FastAPI", "Users, roles, sessions (Keycloak Admin API)", $tags="existing")
+    Container(svc_tenant, "Tenant Management", "FastAPI", "Тенанты, квоты, onboarding", $tags="existing")
+    Container(ff, "Feature Flags", "Unleash", "Canary, kill-switch", $tags="existing")
+}
+
+' ============================================================
+' EVENT BUS (Task2)
+' ============================================================
+System_Boundary(event_bus, "Event Bus (Task2)") {
+    ContainerQueue(kafka, "Kafka", "Apache Kafka (per-region)", "20 событий, tenant_id в envelope, outbox", $tags="existing")
+}
+
+' ============================================================
+' DATA STORES (Task1) + RLS (Task4)
+' ============================================================
+System_Boundary(stores, "Data Stores (per service) + RLS (Task4)") {
+    ContainerDb(dbs, "PostgreSQL (per service)", "PostgreSQL + RLS", "tenant_id в каждой бизнес-таблице. RLS policy: tenant_id = current_setting('app.tenant_id')", $tags="existing")
+    ContainerDb(clickhouse, "ClickHouse", "Data Warehouse", "Агрегаты (tenant_id) + usage_metering (Task4)", $tags="existing")
+}
+
+' ============================================================
+' OBSERVABILITY (Task2) + tenant-aware (Task4)
+' ============================================================
+System_Boundary(observability, "Observability (Task2 + Task4)") {
+    Container(otel, "OTel Collector", "OpenTelemetry", "Traces / metrics / logs с tenant_id", $tags="monitor")
+    Container(prometheus, "Prometheus", "TSDB", "Метрики с tenant_id label. Per-tenant SLO rules", $tags="monitor")
+    Container(loki, "Loki", "Log Aggregation", "Structured logs с tenant_id. Audit logs", $tags="monitor")
+    Container(jaeger, "Jaeger", "Distributed Tracing", "Traces с tenant_id", $tags="monitor")
+    Container(grafana, "Grafana", "Dashboards", "Tenant Health, Platform Tenants, Onboarding, Billing, Security, SLO", $tags="monitor")
+    Container(alertmanager, "Alertmanager", "Alerting", "Per-tenant routes. P1 → PagerDuty, P2/P3 → Slack/email", $tags="monitor")
+    Container(usage_metering, "Usage Metering", "Flink job / batch", "Trips, API calls, storage → ClickHouse → billing", $tags="new")
+}
+
+' ============================================================
+' GLOBAL CONTROL PLANE (Task3)
+' ============================================================
+System_Boundary(gcp, "Global Control Plane (EU / Frankfurt, Task3 ADR-002)") {
+    Container(tenant_config, "Tenant Config Sync", "Config Service", "Tenant configs (non-PII): quotas, tariff, SLO, home_region", $tags="global")
+    Container(schema_registry, "Apicurio Registry", "Schema Registry", "Avro schemas", $tags="global")
+    Container(vault, "Vault", "Secrets Management", "Keys, credentials", $tags="global")
+}
+
+' ============================================================
+' EXTERNAL SYSTEMS
+' ============================================================
+System_Ext(psp, "PSP (Yandex Pay / GrabPay / Mercado Pago / Network Intl)", "Платёжные шлюзы per-region", $tags="existing")
+System_Ext(maps, "Maps (Yandex / Google)", "Карты per-region", $tags="existing")
+System_Ext(bank, "Bank API (per-region)", "Выплаты водителям", $tags="existing")
+System_Ext(kyc, "KYC Provider", "Per-region (enterprise onboarding)", $tags="external")
+System_Ext(push, "Push (FCM / APNs / Huawei)", "Push-уведомления", $tags="existing")
+
+' ============================================================
+' RELATIONS: CLIENTS → EDGE → BFF
+' ============================================================
+Rel(passenger, edge_chain, "HTTPS", "OIDC")
+Rel(driver, edge_chain, "HTTPS", "OIDC")
+Rel(manager, edge_chain, "HTTPS", "OIDC")
+Rel(accountant, edge_chain, "HTTPS", "OIDC")
+Rel(platform_admin, edge_chain, "HTTPS", "OIDC")
+Rel(partner, edge_chain, "Onboarding form", "HTTPS")
+
+Rel(edge_chain, kong, "После WAF / DDoS / GLB", "HTTPS")
+
+Rel(kong, bff_passenger, "Маршрутизация", "REST")
+Rel(kong, bff_driver, "Маршрутизация", "REST")
+Rel(kong, bff_corp, "Маршрутизация", "REST")
+Rel(kong, bff_admin, "Маршрутизация", "REST")
+Rel(kong, bff_web, "Маршрутизация", "REST")
+
+' JWT validation
+Rel(kong, keycloak, "JWKS validation", "HTTPS")
+
+' ============================================================
+' BFF → MIDDLEWARE → SERVICES
+' ============================================================
+Rel(bff_passenger, tenant_mw, "tenant_id из JWT", "internal")
+Rel(bff_driver, tenant_mw, "tenant_id из JWT", "internal")
+Rel(bff_corp, tenant_mw, "tenant_id из JWT", "internal")
+Rel(bff_admin, tenant_mw, "tenant_id из JWT", "internal")
+Rel(bff_web, tenant_mw, "tenant_id из JWT", "internal")
+
+Rel(bff_passenger, rbac_mw, "scope check", "internal")
+Rel(bff_driver, rbac_mw, "scope check", "internal")
+Rel(bff_corp, rbac_mw, "scope check", "internal")
+Rel(bff_admin, rbac_mw, "scope check", "internal")
+Rel(bff_web, rbac_mw, "scope check", "internal")
+
+Rel(bff_passenger, svc_booking, "REST", "HTTPS")
+Rel(bff_passenger, svc_pricing, "REST", "HTTPS")
+Rel(bff_passenger, svc_payments, "REST", "HTTPS")
+Rel(bff_driver, svc_driver_profile, "REST", "HTTPS")
+Rel(bff_driver, svc_driver_status, "REST", "HTTPS")
+Rel(bff_driver, svc_payouts, "REST", "HTTPS")
+Rel(bff_corp, svc_booking, "REST", "HTTPS")
+Rel(bff_corp, svc_analytics, "REST", "HTTPS")
+Rel(bff_admin, svc_tenant, "REST", "HTTPS")
+Rel(bff_admin, svc_identity, "REST", "HTTPS")
+Rel(bff_admin, svc_fraud, "REST", "HTTPS")
+
+' ============================================================
+' SERVICES → DB (RLS) / KAFKA
+' ============================================================
+Rel(svc_booking, dbs, "R/W (RLS: tenant_id)", "SQL")
+Rel(svc_payments, dbs, "R/W (RLS)", "SQL")
+Rel(svc_payouts, dbs, "R/W (RLS)", "SQL")
+Rel(svc_driver_profile, dbs, "R/W (RLS)", "SQL")
+Rel(svc_driver_status, dbs, "R/W (RLS)", "SQL")
+Rel(svc_identity, dbs, "R/W (RLS)", "SQL")
+Rel(svc_tenant, dbs, "R/W (без RLS — платформенный)", "SQL")
+
+Rel(svc_booking, kafka, "Publish / Subscribe", "Kafka")
+Rel(svc_payments, kafka, "Publish / Subscribe", "Kafka")
+Rel(svc_notification, kafka, "Subscribe", "Kafka")
+
+' ============================================================
+' IAM
+' ============================================================
+Rel(svc_identity, keycloak, "Admin API", "HTTPS")
+Rel(svc_tenant, keycloak, "Create groups, roles (onboarding)", "Admin API")
+
+' ============================================================
+' ONBOARDING
+' ============================================================
+Rel(svc_tenant, keycloak, "Create group / user / role", "Admin API")
+Rel(svc_tenant, svc_identity, "Sync user", "REST")
+Rel(svc_tenant, svc_notification, "Welcome email", "REST")
+Rel(svc_tenant, kyc, "KYC (enterprise)", "HTTPS")
+Rel(svc_tenant, kafka, "Publish Tenant.Onboarded", "Kafka")
+
+' ============================================================
+' TENANT CONFIG SYNC
+' ============================================================
+Rel(svc_tenant, tenant_config, "Sync config (non-PII)", "HTTPS")
+Rel(tenant_config, svc_tenant, "Read-копия (pull)", "HTTPS")
+Rel(svc_tenant, schema_registry, "Register schemas", "HTTPS")
+Rel(svc_tenant, vault, "Secrets", "HTTPS")
+
+' ============================================================
+' USAGE METERING
+' ============================================================
+Rel(tenant_mw, prometheus, "Metrics (tenant_id label)", "Remote Write")
+Rel(prometheus, usage_metering, "Aggregated metrics", "PromQL")
+Rel(usage_metering, clickhouse, "Usage metering (tenant_id)", "JDBC")
+Rel(clickhouse, svc_payments, "Usage data (billing)", "SQL")
+
+' ============================================================
+' OBSERVABILITY
+' ============================================================
+Rel(svc_booking, otel, "Traces / metrics / logs", "OTLP")
+Rel(svc_payments, otel, "Traces / metrics / logs", "OTLP")
+Rel(bff_passenger, otel, "Traces / metrics / logs", "OTLP")
+Rel(bff_admin, otel, "Traces / metrics / logs", "OTLP")
+Rel(otel, prometheus, "Metrics", "Remote Write")
+Rel(otel, loki, "Logs", "Loki Push API")
+Rel(otel, jaeger, "Traces", "OTLP")
+
+Rel(prometheus, grafana, "Metrics", "PromQL")
+Rel(loki, grafana, "Logs", "LogQL")
+Rel(jaeger, grafana, "Traces", "Jaeger API")
+Rel(prometheus, alertmanager, "Alerts (per tenant)", "Webhook")
+
+' ============================================================
+' EXTERNAL
+' ============================================================
+Rel(svc_payments, psp, "Платежи", "HTTPS")
+Rel(svc_payouts, bank, "Выплаты", "HTTPS")
+Rel(svc_geography, maps, "Геокодирование", "HTTPS")
+Rel(svc_notification, push, "Push", "HTTPS")
+
+' ============================================================
+' LEGEND
+' ============================================================
+legend right
+  |= Цвет |= Значение |
+  |<#E3F2FD> Существующее | Из Task1–3: Kong, BFF, сервисы, Keycloak, svc_identity, svc_tenant, Kafka, БД, Global Control Plane |
+  |<#FFEBEE> Новое в Task4 | Tenant-aware middleware, RBAC middleware, Usage Metering |
+  |<#E8F5E9> Monitoring | Observability (Task2) + per-tenant extensions (Task4) |
+  |<#FFF3E0> Global | Global Control Plane (Task3) |
+  |<#F3E5F5> Внешнее | KYC Provider (enterprise onboarding) |
+  | -- | -- |
+  | RLS | tenant_id в каждой бизнес-таблице, policy: tenant_id = current_setting('app.tenant_id') |
+  | tenant_id | Присутствует в JWT, метриках, логах, traces |
+  | Onboarding Workflow | Модуль внутри svc_tenant — детализация в C3_Onboarding.puml (не отрисован как контейнер) |
+endlegend
+
+@enduml

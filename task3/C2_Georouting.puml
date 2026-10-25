@@ -1,0 +1,189 @@
+@startuml C2_Georouting
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title GoFuture — C2 Georouting (Task3). Красным — новое, синим — из Task1/Task2
+
+skinparam defaultFontColor #000000
+skinparam ArrowFontColor #333333
+skinparam ArrowColor #555555
+
+AddElementTag("new",      $bgColor="#FFEBEE", $borderColor="#C62828", $fontColor="#B71C1C")
+AddElementTag("existing", $bgColor="#E3F2FD", $borderColor="#1565C0", $fontColor="#0D47A1")
+AddElementTag("global",   $bgColor="#FFF3E0", $borderColor="#E65100", $fontColor="#BF360C")
+
+' ============================================================
+' CLIENTS (из Task1 C2 Final)
+' ============================================================
+Person(passenger, "Пассажир", "Заказывает поездки", $tags="existing")
+Person(driver,    "Водитель",  "Выполняет поездки", $tags="existing")
+Person(manager,   "Корп-менеджер", "Управляет корп-поездками", $tags="existing")
+Person(accountant,"Бухгалтер", "Контролирует выплаты", $tags="existing")
+Person(web_user,  "Веб-пользователь", "Публичный веб", $tags="existing")
+
+' ============================================================
+' EDGE LAYER (новое в Task3)
+' ============================================================
+System_Boundary(edge_global, "Global Edge Layer (новое в Task3)") {
+    Container(geodns,   "GeoDNS", "Cloudflare DNS", "Геомаршрутизация по IP. TTL 60 сек. RU-пользователи -> region-ru (политика)", $tags="new")
+    Container(waf,      "WAF", "Cloudflare WAF", "OWASP Top-10, rate limiting, bot protection, custom rules", $tags="new")
+    Container(ddos,     "DDoS Protection", "Cloudflare / AntiDDoS", "Volumetric, protocol, application-layer (L3-L7)", $tags="new")
+    Container(glb,      "Global Load Balancer", "L7 GLB", "Health-checked, active-active, weight-based, TLS termination", $tags="new")
+}
+
+' ============================================================
+' GLOBAL IDENTITY DIRECTORY (из ADR-002)
+' ============================================================
+System_Boundary(identity_global, "Global Control Plane (из ADR-002)") {
+    Container(identity_dir, "Global Identity Directory", "user_id -> home_region", "Роутинг путешественников. Без PII. Read-копии во всех регионах", $tags="global")
+}
+
+' ============================================================
+' REGION RU
+' ============================================================
+System_Boundary(region_ru, "region-ru (152-ФЗ)") {
+
+    System_Boundary(ru_edge, "Regional Edge & Security (новое)") {
+        Container(ru_fw,     "Network Firewall", "Cloud Firewall", "IP allow/deny, geo-blocking, egress filtering", $tags="new")
+        Container(ru_ingress,"Regional Ingress (Kong)", "Kong (из Task1)", "mTLS, JWT, canary. /health endpoint", $tags="existing")
+    }
+
+    System_Boundary(ru_app, "GoFuture Platform (из Task1/Task2)") {
+        Container(ru_cache, "Edge Cache", "Redis", "Non-PII only: hashed(email/phone), payment_token, home_region. TTL 5-15 мин", $tags="new")
+        Container(ru_bff,   "BFF (Passenger / Driver / Corporate / Admin / Web)", "FastAPI", "Из Task1 C2", $tags="existing")
+        Container(ru_svc,   "Микросервисы (10 + 4 платформенных)", "Python / FastAPI", "Из Task1 C2. Kafka, Flink, БД — из Task2", $tags="existing")
+    }
+}
+
+' ============================================================
+' REGION SEA
+' ============================================================
+System_Boundary(region_sea, "region-sea (PDPA SG + ID)") {
+
+    System_Boundary(sea_edge, "Regional Edge & Security (новое)") {
+        Container(sea_fw,     "Network Firewall", "Cloud Firewall", "IP allow/deny, geo-blocking", $tags="new")
+        Container(sea_ingress,"Regional Ingress (Kong)", "Kong (из Task1)", "mTLS, JWT, canary. /health endpoint", $tags="existing")
+    }
+
+    System_Boundary(sea_app, "GoFuture Platform (из Task1/Task2)") {
+        Container(sea_cache, "Edge Cache", "Redis", "Non-PII, TTL 5-15 мин", $tags="new")
+        Container(sea_bff,   "BFF (Passenger / Driver / Corporate / Admin / Web)", "FastAPI", "Из Task1 C2", $tags="existing")
+        Container(sea_svc,   "Микросервисы", "Python / FastAPI", "Из Task1 C2", $tags="existing")
+    }
+}
+
+' ============================================================
+' REGION LATAM
+' ============================================================
+System_Boundary(region_latam, "region-latam (LGPD)") {
+
+    System_Boundary(latam_edge, "Regional Edge & Security (новое)") {
+        Container(latam_fw,     "Network Firewall", "Cloud Firewall", "IP allow/deny, geo-blocking", $tags="new")
+        Container(latam_ingress,"Regional Ingress (Kong)", "Kong (из Task1)", "mTLS, JWT, canary. /health endpoint", $tags="existing")
+    }
+
+    System_Boundary(latam_app, "GoFuture Platform (из Task1/Task2)") {
+        Container(latam_cache, "Edge Cache", "Redis", "Non-PII, TTL 5-15 мин", $tags="new")
+        Container(latam_bff,   "BFF (Passenger / Driver / Corporate / Admin / Web)", "FastAPI", "Из Task1 C2", $tags="existing")
+        Container(latam_svc,   "Микросервисы", "Python / FastAPI", "Из Task1 C2", $tags="existing")
+    }
+}
+
+' ============================================================
+' REGION MENA
+' ============================================================
+System_Boundary(region_mena, "region-mena (UAE DP)") {
+
+    System_Boundary(mena_edge, "Regional Edge & Security (новое)") {
+        Container(mena_fw,     "Network Firewall", "Cloud Firewall", "IP allow/deny, geo-blocking", $tags="new")
+        Container(mena_ingress,"Regional Ingress (Kong)", "Kong (из Task1)", "mTLS, JWT, canary. /health endpoint", $tags="existing")
+    }
+
+    System_Boundary(mena_app, "GoFuture Platform (из Task1/Task2)") {
+        Container(mena_cache, "Edge Cache", "Redis", "Non-PII, TTL 5-15 мин", $tags="new")
+        Container(mena_bff,   "BFF (Passenger / Driver / Corporate / Admin / Web)", "FastAPI", "Из Task1 C2", $tags="existing")
+        Container(mena_svc,   "Микросервисы", "Python / FastAPI", "Из Task1 C2", $tags="existing")
+    }
+}
+
+' ============================================================
+' СВЯЗИ: CLIENTS -> EDGE
+' ============================================================
+Rel(passenger, geodns, "DNS-запрос (ближайший регион)", "DNS")
+Rel(driver,    geodns, "DNS-запрос (домашний регион)", "DNS")
+Rel(manager,   geodns, "DNS-запрос", "DNS")
+Rel(accountant,geodns, "DNS-запрос", "DNS")
+Rel(web_user,  geodns, "DNS-запрос", "DNS")
+
+Rel(geodns, waf,   "IP ближайшего региона", "DNS -> HTTPS")
+Rel(waf,    ddos,  "После WAF-фильтрации", "HTTPS")
+Rel(ddos,   glb,   "После DDoS-фильтрации", "HTTPS")
+
+' ============================================================
+' GLB -> REGIONAL INGRESS (health-checked)
+' ============================================================
+Rel(glb, ru_fw,       "Health-checked трафик", "HTTPS")
+Rel(glb, sea_fw,      "Health-checked трафик", "HTTPS")
+Rel(glb, latam_fw,    "Health-checked трафик", "HTTPS")
+Rel(glb, mena_fw,     "Health-checked трафик", "HTTPS")
+
+' Health checks
+Rel(glb, ru_ingress,    "Health check /health (10 сек)", "HTTPS")
+Rel(glb, sea_ingress,   "Health check /health (10 сек)", "HTTPS")
+Rel(glb, latam_ingress, "Health check /health (10 сек)", "HTTPS")
+Rel(glb, mena_ingress,  "Health check /health (10 сек)", "HTTPS")
+
+' ============================================================
+' REGIONAL: FW -> Ingress -> BFF
+' ============================================================
+Rel(ru_fw,    ru_ingress, "После firewall", "HTTPS")
+Rel(ru_ingress, ru_bff,   "mTLS, JWT, маршрутизация", "REST")
+Rel(ru_bff,   ru_svc,     "Вызовы сервисов", "REST")
+
+Rel(sea_fw,    sea_ingress, "После firewall", "HTTPS")
+Rel(sea_ingress, sea_bff,   "mTLS, JWT, маршрутизация", "REST")
+Rel(sea_bff,   sea_svc,     "Вызовы сервисов", "REST")
+
+Rel(latam_fw,    latam_ingress, "После firewall", "HTTPS")
+Rel(latam_ingress, latam_bff,   "mTLS, JWT, маршрутизация", "REST")
+Rel(latam_bff,   latam_svc,     "Вызовы сервисов", "REST")
+
+Rel(mena_fw,    mena_ingress, "После firewall", "HTTPS")
+Rel(mena_ingress, mena_bff,   "mTLS, JWT, маршрутизация", "REST")
+Rel(mena_bff,   mena_svc,     "Вызовы сервисов", "REST")
+
+' ============================================================
+' EDGE CACHE
+' ============================================================
+Rel(ru_bff, ru_cache, "Чтение non-PII (hashed(email/phone), payment_token, home_region)", "Redis")
+Rel(sea_bff,   sea_cache, "Чтение non-PII", "Redis")
+Rel(latam_bff, latam_cache, "Чтение non-PII", "Redis")
+Rel(mena_bff,  mena_cache, "Чтение non-PII", "Redis")
+
+' ============================================================
+' ROUTING: home_region lookup (роуминг)
+' ============================================================
+Rel(ru_bff,    identity_dir, "Lookup home_region (роуминг)", "HTTPS")
+Rel(sea_bff,   identity_dir, "Lookup home_region (роуминг)", "HTTPS")
+Rel(latam_bff, identity_dir, "Lookup home_region (роуминг)", "HTTPS")
+Rel(mena_bff,  identity_dir, "Lookup home_region (роуминг)", "HTTPS")
+
+' ============================================================
+' РОУМИНГ: cross-region API (пример: пассажир из RU в SEA)
+' ============================================================
+Rel(sea_bff, ru_bff, "Roaming API call: профиль, история, KYC (PII не реплицируется)", "HTTPS")
+Rel(latam_bff, ru_bff, "Roaming API call (пример)", "HTTPS")
+Rel(mena_bff, latam_bff, "Roaming API call (пример)", "HTTPS")
+
+' ============================================================
+' LEGEND
+' ============================================================
+legend right
+  |= Цвет |= Значение |
+  |<#E3F2FD> Существующее | Из Task1/Task2: клиенты, Kong, BFF, микросервисы |
+  |<#FFEBEE> Новое в Task3 | GeoDNS, WAF, DDoS, Firewall, GLB, Edge Cache, health checks |
+  |<#FFF3E0> Global | Global Identity Directory (из ADR-002) |
+  | Health check | GLB -> Regional Ingress (10 сек, таймаут 3 сек) |
+  | Roaming API | Cross-region API-вызов к домашнему региону (PII не реплицируется) |
+endlegend
+
+@enduml

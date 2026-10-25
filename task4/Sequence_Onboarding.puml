@@ -1,0 +1,119 @@
+@startuml Sequence_Onboarding
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Sequence.puml
+
+title GoFuture — Onboarding Flow (Task4). Self-service и Enterprise.
+
+skinparam SequenceArrowColor #333333
+skinparam SequenceLifeLineBorderColor #555555
+skinparam defaultFontColor #000000
+skinparam SequenceGroupBorderColor #C62828
+
+actor "Партнёр (SMB)" as smb
+actor "Sales (Enterprise)" as sales
+participant "Onboarding Form / API" as form #E3F2FD
+participant "Onboarding Workflow\n(svc_tenant)" as wf #FFEBEE
+participant "svc_tenant" as tenant #E3F2FD
+database "Tenant DB" as db #E3F2FD
+participant "Keycloak" as kc #E3F2FD
+participant "svc_identity" as identity #E3F2FD
+participant "Billing Service\n(новый в Task4)" as billing #FFEBEE
+participant "Notification" as notif #E3F2FD
+participant "Kafka" as kafka #E3F2FD
+participant "Global Control Plane" as gcp #FFF3E0
+participant "Loki (audit)" as loki #E3F2FD
+participant "KYC Provider" as kyc #F3E5F5
+
+== Выбор потока ==
+alt Self-service (SMB)
+    smb -> form: Заполняет форму (email, название, страна, тариф SMB)
+    form -> wf: create onboarding_request (request_id, flow=self_service)
+else Enterprise
+    sales -> form: Создаёт заявку (юрлицо, KYC, тариф ENT)
+    form -> wf: create onboarding_request (request_id, flow=enterprise)
+    wf -> kyc: Инициировать KYC (юрлицо)
+    kyc --> wf: KYC result (webhook, async)
+    note right of wf: Ждёт KYC + approval\n(sales + legal + finance)
+    sales -> wf: Approval (approve)
+end
+
+== Общее ядро (шаги 3-10) ==
+wf -> loki: audit: onboarding_initiated
+
+group 1. Валидация
+    wf -> tenant: validate(email, domain, duplicate, country, home_region)
+    tenant -> db: SELECT check duplicate (email, home_region)
+    db --> tenant: OK / duplicate
+    alt Duplicate
+        tenant --> wf: Error: tenant_exists
+        wf --> form: 409 Conflict
+        wf -> loki: audit: onboarding_failed (duplicate)
+    end
+end
+
+group 2. Создание тенанта
+    wf -> tenant: create_tenant(home_region, tariff, quotas)
+    tenant -> db: INSERT tenant (status=pending)
+    db --> tenant: tenant_id
+    tenant --> wf: tenant_id
+    wf -> loki: audit: tenant_created
+end
+
+group 3. Keycloak provisioning
+    wf -> kc: Create group tenant:<uuid>
+    kc --> wf: group_id
+    wf -> kc: Create user (email tenant_admin, temporary)
+    kc --> wf: user_id
+    wf -> kc: Assign role tenant_admin to user
+    kc --> wf: OK
+    wf -> identity: Sync user -> svc_identity
+    identity --> wf: OK
+    wf -> loki: audit: keycloak_provisioned
+end
+
+group 4. Конфигурация (billing, quotas)
+    wf -> billing: Setup billing (SMB: card / ENT: invoice)
+    billing --> wf: OK
+    wf -> tenant: Update quotas (SMB default / ENT custom)
+    tenant -> db: UPDATE tenant (quotas, tariff)
+    wf -> loki: audit: config_applied
+end
+
+group 5. Публикация события
+    wf -> kafka: Publish Tenant.Onboarded (tenant_id, home_region, tariff, flow)
+    note right of kafka: Outbox pattern\n(Task2 ADR-005)
+    kafka -> identity: Consume Tenant.Onboarded
+    kafka -> notif: Consume Tenant.Onboarded
+    wf -> loki: audit: event_published
+end
+
+group 6. Уведомление
+    wf -> notif: Welcome email + set-password link
+    notif --> smb: Welcome email
+    notif --> sales: Уведомление (enterprise: tenant created)
+    wf -> loki: audit: onboarding_completed
+end
+
+group 7. Global config
+    wf -> tenant: publish tenant_config
+    tenant -> gcp: Sync tenant config (non-PII: quotas, tariff, home_region)
+    wf -> loki: audit: global_config_synced
+end
+
+group 8. Активация
+    wf -> tenant: Update status = active
+    tenant -> db: UPDATE tenant (status=active)
+end
+
+== Ошибка и компенсация (пример: Keycloak недоступен) ==
+opt Ошибка на шаге 3
+    wf -> kc: Create group (timeout)
+    kc --> wf: Error
+    wf -> wf: retry (3 раза, backoff)
+    alt Все retry неудачны
+        wf -> tenant: UPDATE status = failed
+        wf -> loki: audit: onboarding_failed (step=keycloak)
+        wf -> notif: Email партнёру "проблема, разбираемся"
+    end
+end
+
+@enduml

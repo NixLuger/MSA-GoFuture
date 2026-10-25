@@ -1,0 +1,64 @@
+@startuml Sequence_IAM_Flow
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Sequence.puml
+
+title GoFuture — IAM Flow (Task4). Аутентификация → авторизация → RLS.
+' Красным — новое в Task4, синим — существующее из Task1–3.
+
+skinparam SequenceArrowColor #333333
+skinparam SequenceLifeLineBorderColor #555555
+skinparam defaultFontColor #000000
+
+actor "Пользователь" as user
+participant "Keycloak\n(per-region)" as kc #E3F2FD
+participant "Kong\n(Regional Ingress)" as kong #E3F2FD
+participant "BFF" as bff #E3F2FD
+participant "BFF RBAC\nMiddleware\n(библиотека)" as rbac #FFEBEE
+participant "Service\n(Booking / Payments / …)" as svc #E3F2FD
+database "PostgreSQL\n(RLS)" as db #E3F2FD
+participant "Loki\n(audit)" as loki #E3F2FD
+
+== 1. Аутентификация (SSO) ==
+user -> kc: Логин (username / password + OTP для админов)
+note right of kc: SSO session\n(общая для всех клиентов тенанта)
+kc --> user: JWT (access + refresh)\nclaims: sub, tenant_id, region, roles, scope
+
+== 2. Запрос к API ==
+user -> kong: HTTPS request + JWT
+kong -> kc: GET /certs (JWKS, кэш)
+kc --> kong: Public keys
+note right of kong: Валидация JWT:\n- signature\n- exp\n- iss\n- aud\nRate limiting per tenant_id
+alt JWT невалиден
+    kong --> user: 401 Unauthorized
+    kong -> loki: audit: auth_failed
+end
+
+== 3. Fine-grained authorization ==
+kong -> bff: Проксирование (после валидации)
+bff -> rbac: check_scope(required_scope, JWT.scope)
+alt scope отсутствует
+    rbac --> bff: 403 Forbidden
+    bff -> loki: audit: scope_denied\n(tenant_id, user_id, scope)
+    bff --> user: 403 Forbidden
+else scope есть
+    rbac --> bff: OK
+end
+
+== 4. Business logic + RLS ==
+bff -> svc: Запрос + контекст\n(user_id, tenant_id, scopes)
+svc -> db: SET app.tenant_id = '<tenant_id>'
+svc -> db: SELECT / UPDATE / INSERT
+note right of db: RLS policy:\nWHERE tenant_id = current_setting('app.tenant_id')
+alt RLS violation (попытка обойти)
+    db --> svc: Ошибка / пустой результат
+    svc -> loki: P1 alert: rls_violation
+else OK
+    db --> svc: Данные только своего tenant
+end
+svc --> bff: Response
+bff --> user: Response
+
+== 5. Аудит ==
+bff -> loki: audit: access\n(tenant_id, user_id, resource, action)
+note right of loki: Retention: 5 лет (финансы),\n1 год (остальные)
+
+@enduml

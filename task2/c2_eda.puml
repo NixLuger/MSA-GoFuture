@@ -1,0 +1,186 @@
+@startuml C2_Event_Driven_Platform
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title GoFuture — C2 Event-Driven Platform (v2)
+
+skinparam defaultFontColor #000000
+skinparam ArrowFontColor #333333
+skinparam ArrowColor #555555
+
+AddElementTag("producer",   $bgColor="#E3F2FD", $borderColor="#1565C0", $fontColor="#0D47A1")
+AddElementTag("consumer",   $bgColor="#F3E5F5", $borderColor="#6A1B9A", $fontColor="#4A148C")
+AddElementTag("both",       $bgColor="#E1BEE7", $borderColor="#6A1B9A", $fontColor="#4A148C")
+AddElementTag("flink",      $bgColor="#FFF3E0", $borderColor="#E65100", $fontColor="#BF360C")
+AddElementTag("kafka",      $bgColor="#FFF9C4", $borderColor="#F57F17", $fontColor="#F57F17")
+AddElementTag("monitor",    $bgColor="#E8F5E9", $borderColor="#2E7D32", $fontColor="#1B5E20")
+AddElementTag("saga",       $bgColor="#FCE4EC", $borderColor="#C2185B", $fontColor="#880E4F")
+AddElementTag("ml",         $bgColor="#E0F7FA", $borderColor="#00838F", $fontColor="#006064")
+
+' === SERVICES (producers + consumers) ===
+System_Boundary(services, "Business Services (producers + consumers)") {
+    Container(svc_booking, "Booking", "Python (FastAPI)", "API + Saga Orchestrator (Booking Lifecycle). Публикует Booking.Created / Cancelled / Completed. Подписан на Fraud.CheckCompleted. Матчинг вынесен в flink_matching", $tags="both,saga")
+    Container(svc_driver_status, "Driver Status", "Python (FastAPI)", "Публикует Driver.LocationUpdated, Driver.StatusChanged (высокочастотные). Подписан на Booking.Assigned", $tags="both")
+    Container(svc_driver_profile, "Driver Profile", "Python (FastAPI)", "Публикует Driver.VerificationCompleted", $tags="producer")
+    Container(svc_pricing, "Pricing", "Python (FastAPI)", "API + БД тарифов. Расчёт цены — во flink_pricing. Читает Pricing.PriceCalculated для API-ответов", $tags="consumer")
+    Container(svc_payments, "Payments", "Python (FastAPI)", "API + Saga Orchestrator (Payment+Payout). Публикует Payment.Succeeded / Failed / Refunded. Подписан на Payout.Completed / Payout.Failed", $tags="both,saga")
+    Container(svc_payouts, "Payouts", "Python (FastAPI)", "API + БД выплат. Публикует Payout.Initiated / Completed / Failed. Подписан на Payment.Succeeded (триггер выплаты)", $tags="both")
+    Container(svc_notification, "Notification", "Python (FastAPI)", "Choreography. Подписан на все доменные события (routing rules). Публикует Notification.Sent / Failed. Отправка push/SMS/email", $tags="both")
+    Container(svc_fraud, "Fraud", "Python (FastAPI)", "API управления правилами и read-path fraud-скоринга. Streaming-скоринг — во flink_fraud", $tags="consumer")
+    Container(svc_tenant, "Tenant Management", "Python (FastAPI)", "Публикует Tenant.Onboarded", $tags="producer")
+    Container(svc_identity, "Identity", "Python (FastAPI)", "Публикует User.Registered", $tags="producer")
+}
+
+' === OUTBOX ===
+System_Boundary(outbox_boundary, "Outbox (transactional publish)") {
+    ContainerDb(outbox_db, "Outbox Tables", "PostgreSQL (per service)", "Транзакционная публикация событий (ADR-005). Poller / Debezium публикует в Kafka. Есть у всех сервисов-продюсеров")
+}
+
+' === SCHEMA REGISTRY ===
+Container(apicurio, "Apicurio Registry", "Schema Registry", "Avro-схемы, backward-compatible evolution, schema validation (ADR-002)", $tags="kafka")
+
+' === KAFKA ===
+System_Boundary(kafka_boundary, "Kafka Cluster (per region)") {
+    ContainerQueue(kafka_events, "Kafka: events", "Apache Kafka", "27 events-топиков (9 типов × 3 региона) + 27 DLQ = 54. RF=3, acks=all. Retention: Critical 30д, Important 14д, Informational 72ч (ADR-002)", $tags="kafka")
+    ContainerQueue(kafka_location, "Kafka: driver.location", "Apache Kafka", "100 партиций, compaction по driver_id. ∞ retention (последнее состояние) (ADR-002)", $tags="kafka")
+    ContainerQueue(kafka_retry, "Kafka: retry.1/2/3", "Apache Kafka", "Retry-топики с задержками 1/5/15 мин (ADR-005)", $tags="kafka")
+    ContainerQueue(kafka_dlq, "Kafka: DLQ", "Apache Kafka", "Dead Letter Queue — после 3 retry / permanent errors. Retention 30 дней (ADR-005)", $tags="kafka")
+}
+
+' === FLINK JOBS ===
+System_Boundary(flink_boundary, "Flink Jobs (PyFlink) — real-time processing") {
+    Container(flink_pricing, "pricing-streaming-job", "PyFlink", "Потребляет Booking.Created, Driver.LocationUpdated. Публикует Pricing.PriceCalculated. Окна 1/5 мин. p99 < 100 мс (ADR-003)", $tags="flink")
+    Container(flink_matching, "matching-streaming-job", "PyFlink", "Потребляет Booking.Created, Driver.LocationUpdated, Driver.StatusChanged. Публикует Booking.Assigned. «Умное» перераспределение. p99 < 500 мс (ADR-003)", $tags="flink")
+    Container(flink_fraud, "fraud-streaming-job", "PyFlink", "Потребляет Payment.*, Booking.Created. Публикует Fraud.CheckCompleted / AlertRaised. ML + правила. p99 < 200 мс (ADR-003)", $tags="flink")
+    Container(flink_analytics, "analytics-streaming-job", "PyFlink", "Потребляет все доменные события. Не публикует в Kafka — пишет агрегаты в ClickHouse. p99 < 5 сек (ADR-003)", $tags="flink")
+}
+
+' === ML PLATFORM ===
+Container(ml, "ML Platform", "MLflow / Kubeflow", "Обучение и serving ML-моделей. Деплой в flink_pricing (прогноз спроса) и flink_fraud (детекция)", $tags="ml")
+
+' === DATA PLATFORM ===
+System_Boundary(data_platform, "Data Platform") {
+    Container(clickhouse, "ClickHouse", "Data Warehouse", "Аналитические данные из flink_analytics", $tags="consumer")
+}
+
+' === MONITORING ===
+System_Boundary(monitoring, "Observability (ADR-006)") {
+    Container(kafka_exporter, "Kafka Exporter", "Prometheus Exporter", "Метрики Kafka: lag, ISR, under-replicated, controller health, disk", $tags="monitor")
+    Container(flink_reporter, "Flink Metrics Reporter", "Prometheus Reporter", "Метрики Flink: checkpoint, backpressure, watermark, state size", $tags="monitor")
+    Container(otel, "OTel Collector", "OpenTelemetry", "Сбор traces. Сквозной correlation_id для Saga", $tags="monitor")
+    Container(prometheus, "Prometheus", "Metrics Store", "TSDB. Сбор метрик от exporter'ов и custom middleware", $tags="monitor")
+    Container(loki, "Loki", "Log Aggregation", "Structured logs (JSON) от всех сервисов", $tags="monitor")
+    Container(jaeger, "Jaeger", "Distributed Tracing", "Хранение и поиск traces по correlation_id (Saga)", $tags="monitor")
+    Container(grafana, "Grafana", "Dashboards", "Дашборды: Kafka, Flink, Saga, Business, SLO", $tags="monitor")
+    Container(alertmanager, "Alertmanager", "Alerting", "SLO burn rate, DLQ growth, consumer lag. P1 → PagerDuty, P2/P3 → Slack", $tags="monitor")
+    Container(custom_mw, "Custom Middleware", "Python library", "Бизнес-метрики, retry_total, duplicates_total, idempotent consumer", $tags="monitor")
+}
+
+' === СВЯЗИ: SERVICES → OUTBOX → KAFKA ===
+Rel(svc_booking, outbox_db, "Запись события в outbox (одна транзакция с бизнес-изменением)", "SQL")
+Rel(svc_driver_status, outbox_db, "Запись события в outbox", "SQL")
+Rel(svc_payments, outbox_db, "Запись события в outbox", "SQL")
+Rel(svc_payouts, outbox_db, "Запись события в outbox", "SQL")
+Rel(svc_notification, outbox_db, "Запись события в outbox", "SQL")
+Rel(svc_driver_profile, outbox_db, "Запись события в outbox", "SQL")
+Rel(svc_tenant, outbox_db, "Запись события в outbox", "SQL")
+Rel(svc_identity, outbox_db, "Запись события в outbox", "SQL")
+
+Rel(outbox_db, kafka_events, "Publish: 20 событий (ADR-001)", "Kafka protocol")
+Rel(outbox_db, kafka_location, "Publish: Driver.LocationUpdated", "Kafka protocol")
+
+Rel(svc_booking, apicurio, "Регистрация / валидация схемы", "REST")
+Rel(svc_payments, apicurio, "Регистрация / валидация схемы", "REST")
+Rel(svc_notification, apicurio, "Регистрация / валидация схемы", "REST")
+
+' === KAFKA → FLINK ===
+Rel(kafka_events, flink_pricing, "Consume: Booking.Created, Pricing.PriceCalculated", "Kafka")
+Rel(kafka_location, flink_matching, "Consume: Driver.LocationUpdated", "Kafka")
+Rel(kafka_events, flink_matching, "Consume: Booking.Created, Driver.StatusChanged", "Kafka")
+Rel(kafka_events, flink_fraud, "Consume: Payment.*, Booking.Created", "Kafka")
+Rel(kafka_events, flink_analytics, "Consume: все доменные события", "Kafka")
+
+' === FLINK → KAFKA ===
+Rel(flink_pricing, kafka_events, "Produce: Pricing.PriceCalculated", "Kafka")
+Rel(flink_matching, kafka_events, "Produce: Booking.Assigned", "Kafka")
+Rel(flink_fraud, kafka_events, "Produce: Fraud.CheckCompleted, Fraud.AlertRaised", "Kafka")
+Rel(flink_analytics, clickhouse, "Запись агрегатов", "JDBC")
+
+' === KAFKA → SERVICES ===
+Rel(kafka_events, svc_booking, "Subscribe: Fraud.CheckCompleted, Booking.Assigned (для Saga)", "Kafka")
+Rel(kafka_events, svc_payments, "Subscribe: Booking.Completed (Saga trigger), Booking.Cancelled (refund), Payout.Completed, Payout.Failed", "Kafka")
+Rel(kafka_events, svc_payouts, "Subscribe: Payment.Succeeded (триггер выплаты), Booking.Completed (driver info)", "Kafka")
+Rel(kafka_events, svc_notification, "Subscribe: все доменные события", "Kafka")
+Rel(kafka_events, svc_driver_status, "Subscribe: Booking.Assigned, Booking.Cancelled", "Kafka")
+Rel(kafka_events, svc_pricing, "Subscribe: Pricing.PriceCalculated (read-path)", "Kafka")
+
+' === RETRY / DLQ ===
+Rel(svc_notification, kafka_retry, "Retry при transient ошибках", "Kafka")
+Rel(svc_payouts, kafka_retry, "Retry при transient ошибках", "Kafka")
+Rel(svc_payments, kafka_retry, "Retry при transient ошибках", "Kafka")
+Rel(kafka_retry, kafka_dlq, "После 3 retry → DLQ", "Kafka")
+
+' === ML → FLINK ===
+Rel(ml, flink_pricing, "Деплой ML-модели прогнозирования спроса", "Model Registry")
+Rel(ml, flink_fraud, "Деплой ML-модели детекции фрода", "Model Registry")
+
+' === MONITORING ===
+Rel(kafka_events, kafka_exporter, "Метрики Kafka", "Prometheus")
+Rel(kafka_location, kafka_exporter, "Метрики Kafka", "Prometheus")
+Rel(kafka_retry, kafka_exporter, "Метрики Kafka", "Prometheus")
+Rel(kafka_dlq, kafka_exporter, "Метрики Kafka", "Prometheus")
+
+Rel(flink_pricing, flink_reporter, "Метрики Flink", "Prometheus")
+Rel(flink_matching, flink_reporter, "Метрики Flink", "Prometheus")
+Rel(flink_fraud, flink_reporter, "Метрики Flink", "Prometheus")
+Rel(flink_analytics, flink_reporter, "Метрики Flink", "Prometheus")
+
+Rel(svc_booking, otel, "Traces + logs", "OTLP")
+Rel(svc_payments, otel, "Traces + logs", "OTLP")
+Rel(svc_notification, otel, "Traces + logs", "OTLP")
+Rel(svc_payouts, otel, "Traces + logs", "OTLP")
+Rel(flink_pricing, otel, "Traces", "OTLP")
+Rel(flink_matching, otel, "Traces", "OTLP")
+Rel(flink_fraud, otel, "Traces", "OTLP")
+Rel(flink_analytics, otel, "Traces", "OTLP")
+
+Rel(svc_booking, custom_mw, "Business metrics", "Prometheus client")
+Rel(svc_payments, custom_mw, "Business metrics", "Prometheus client")
+Rel(svc_notification, custom_mw, "Business metrics", "Prometheus client")
+
+Rel(kafka_exporter, prometheus, "Metrics", "Remote Write")
+Rel(flink_reporter, prometheus, "Metrics", "Remote Write")
+Rel(custom_mw, prometheus, "Metrics", "Remote Write")
+Rel(otel, prometheus, "Metrics", "Remote Write")
+Rel(otel, loki, "Logs", "Loki Push API")
+Rel(otel, jaeger, "Traces", "OTLP")
+
+Rel(prometheus, grafana, "Metrics for dashboards", "PromQL")
+Rel(loki, grafana, "Logs for dashboards", "LogQL")
+Rel(jaeger, grafana, "Traces for dashboards", "Jaeger API")
+Rel(prometheus, alertmanager, "Alerts (SLO burn rate)", "Webhook")
+
+Rel(apicurio, custom_mw, "Schema violation metrics", "Metrics")
+
+' === FRAUD (API управления правилами + read-path) ===
+Rel(flink_fraud, svc_fraud, "Читает правила fraud", "REST")
+Rel(kafka_events, svc_fraud, "Subscribe: Fraud.CheckCompleted (read-path API)", "Kafka")
+Rel(svc_fraud, otel, "Traces + logs", "OTLP")
+Rel(svc_fraud, custom_mw, "Business metrics", "Prometheus client")
+
+' === APICURIO (регистрация схем от Flink jobs-продюсеров) ===
+Rel(flink_pricing, apicurio, "Регистрация схемы: Pricing.PriceCalculated", "REST")
+Rel(flink_matching, apicurio, "Регистрация схемы: Booking.Assigned", "REST")
+Rel(flink_fraud, apicurio, "Регистрация схем: Fraud.CheckCompleted, Fraud.AlertRaised", "REST")
+
+legend right
+  |= Цвет |= Значение |
+  |<#E3F2FD> Producer | Публикует события |
+  |<#F3E5F5> Consumer | Подписан на события |
+  |<#E1BEE7> Both | Producer + Consumer |
+  |<#FFF3E0> Flink job | Real-time обработка |
+  |<#FFF9C4> Kafka | Топики и очереди |
+  |<#E8F5E9> Monitoring | Observability |
+  |<#E0F7FA> ML Platform | ML |
+endlegend
+
+@enduml

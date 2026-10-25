@@ -1,0 +1,210 @@
+@startuml C2_Final_State
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title GoFuture — C2 Final State (целевое состояние, месяц 12+)
+
+skinparam defaultFontColor #000000
+skinparam ArrowFontColor #333333
+skinparam ArrowColor #555555
+
+' === ACTORS ===
+Person(passenger, "Пассажир", "Заказывает поездки, отслеживает водителя, оплачивает")
+Person(driver, "Водитель", "Принимает заказы, выполняет поездки, получает выплаты")
+Person(manager, "Корпоративный менеджер", "Управляет корпоративными поездками и счетами")
+Person(accountant, "Бухгалтер", "Контролирует выплаты и финансовую отчётность")
+
+System_Boundary(gofuture, "GoFuture Platform") {
+
+    System_Boundary(clients, "Client Apps") {
+        Container(app_passenger, "Пассажирское приложение", "iOS / Android / Huawei (native) + OIDC", "Заказ поездки, выбор тарифа, отслеживание водителя на карте, оплата, история поездок")
+        Container(app_driver, "Водительское приложение", "iOS / Android / Huawei (native) + OIDC", "Приём заказов, навигация, переключение статусов, заработок, выплаты")
+        Container(web_corp, "Корпоративный портал", "React SPA + OIDC", "Заказ поездок для сотрудников, счета, отчёты, лимиты")
+        Container(web_admin, "Админ-панель", "React SPA + OIDC", "Управление тенантами, водителями, выплатами, fraud-правилами")
+        Container(web_frontend, "Новый веб-фронтенд", "React SPA + OIDC", "Публичный веб-интерфейс для пассажиров")
+    }
+
+    System_Boundary(edge, "Edge Layer") {
+        Container(gateway, "API Gateway", "Kong", "Единая точка входа. Маршрутизация: /bff/* → BFF; /api/* → публичные API сервисов. Rate limiting, аутентификация, канареечные релизы")
+        Container(bff_passenger, "BFF Passenger", "Python (FastAPI)", "Агрегация для пассажирского приложения: Booking, Pricing, Geography, Payments")
+        Container(bff_driver, "BFF Driver", "Python (FastAPI)", "Агрегация для водительского приложения: Driver Profile, Driver Status, Booking, Payouts")
+        Container(bff_corp, "BFF Corporate", "Python (FastAPI)", "Агрегация для корпоративного портала: Booking, Payments, Analytics")
+        Container(bff_admin, "BFF Admin", "Python (FastAPI)", "Агрегация для админ-панели: Tenant, Identity, Payouts, Fraud")
+        Container(bff_web, "BFF Web", "Python (FastAPI)", "Агрегация для нового веб-фронтенда. Эволюция ADR-002 (изначально 4 BFF; BFF Web добавлен для публичного веба)")
+    }
+
+    System_Boundary(business, "Business Services") {
+        Container(svc_booking, "Booking", "Python (FastAPI)", "Жизненный цикл поездки. Публикует BookingCreated, BookingCompleted")
+        Container(svc_driver_profile, "Driver Profile", "Python (FastAPI)", "Аккаунт, документы, KYC, рейтинг водителя")
+        Container(svc_driver_status, "Driver Status", "Python (FastAPI)", "Онлайн-статус, геопозиция, занятость. Подписан на BookingCreated и DriverLocationUpdated")
+        Container(svc_pricing, "Pricing", "Python (FastAPI)", "Тарифы, динамическое ценообразование в реальном времени")
+        Container(svc_payments, "Payments", "Python (FastAPI)", "Приём платежей, интеграция с Яндекс Пэй. Публикует PaymentSucceeded / PaymentFailed")
+        Container(svc_payouts, "Payouts", "Python (FastAPI)", "Расчёт заработка и батчевые выплаты водителям через банковский API")
+        Container(svc_notification, "Notification", "Python (FastAPI)", "Push, SMS, email. Подписан на все доменные события")
+        Container(svc_geography, "Geography", "Python (FastAPI)", "Геопоиск водителей, маршруты, тарифные зоны. Интеграция с Яндекс Картами")
+        Container(svc_analytics, "Analytics", "Python (FastAPI)", "Операционная аналитика. Подписан на все доменные события")
+        Container(svc_fraud, "Fraud", "Python (FastAPI)", "Скоринг транзакций, ML-детекция мошенничества. Публикует FraudAlert")
+    }
+
+    System_Boundary(platform, "Platform Services") {
+        Container(keycloak, "Keycloak", "OIDC Provider", "Единый OIDC-провайдер для всех клиентов и сервисов")
+        Container(svc_identity, "Identity Service", "Python + Keycloak adapter", "Управление пользователями, ролями, сессиями")
+        Container(svc_tenant, "Tenant Management", "Python (FastAPI)", "Управление партнёрами/тенантами, квоты, изоляция данных")
+        Container(ff, "Feature Flags", "Unleash / LaunchDarkly", "Canary releases, kill switch, динамическая конфигурация")
+    }
+
+    ContainerQueue(kafka, "Event Bus", "Apache Kafka + Schema Registry", "Шина доменных событий. Backward-compatible эволюция контрактов")
+
+    System_Boundary(stores, "Data Stores (per service)") {
+        ContainerDb(db_booking, "Booking DB", "PostgreSQL", "Поездки, статусы")
+        ContainerDb(db_driver_profile, "Driver Profile DB", "PostgreSQL", "Аккаунты, документы, KYC")
+        ContainerDb(db_driver_status, "Driver Status Store", "Redis + PostGIS", "Геопозиции, геоиндексы")
+        ContainerDb(db_pricing, "Pricing Store", "PostgreSQL + Redis", "Тарифы и кеш цен")
+        ContainerDb(db_payments, "Payments DB", "PostgreSQL", "Платежи, транзакции")
+        ContainerDb(db_payouts, "Payouts DB", "PostgreSQL", "Заработок, батчи выплат")
+        ContainerDb(db_notification, "Notification DB", "PostgreSQL", "Шаблоны, device tokens")
+        ContainerDb(db_geography, "Geography Store", "PostGIS / Elasticsearch", "Зоны, маршруты, геоиндексы")
+        ContainerDb(db_analytics, "Analytics DB", "PostgreSQL", "Агрегированные метрики")
+        ContainerDb(db_fraud, "Fraud DB", "PostgreSQL", "Правила, скоры")
+        ContainerDb(db_identity, "Identity DB", "PostgreSQL", "Пользователи, роли, сессии")
+        ContainerDb(db_tenant, "Tenant DB", "PostgreSQL", "Тенанты, конфигурация")
+    }
+
+    System_Boundary(observability, "Observability") {
+        Container(otel, "OTel Collector", "OpenTelemetry Collector", "Приём traces, metrics, logs от всех сервисов")
+        Container(prometheus, "Prometheus", "Metrics Store", "Хранение метрик, оценка правил алертинга")
+        Container(loki, "Loki", "Log Aggregation", "Централизованное хранение логов")
+        Container(grafana, "Grafana", "Dashboards", "Визуализация, SLO-дашборды")
+        Container(alertmanager, "Alertmanager", "Alerting", "Маршрутизация алертов")
+    }
+
+    System_Boundary(cicd, "CI/CD") {
+        Container(gitlab, "GitLab CI", "CI/CD Server", "Сборка, тесты, деплой сервисов")
+        Container(registry, "Docker Registry", "Container Registry", "Хранение Docker-образов")
+    }
+
+    System_Boundary(data_platform, "Data Platform / ML") {
+        Container(spark, "Stream / Batch Processing", "Spark / Flink", "Обработка событий из Kafka для DWH")
+        Container(clickhouse, "Data Warehouse", "ClickHouse", "Колоночное хранилище для BI и ML")
+        Container(ml, "ML Platform", "MLflow / Kubeflow", "Обучение и serving ML-моделей")
+        Container(bi, "BI Tools", "DataLens", "Дашборды и отчёты")
+    }
+}
+
+System_Ext(push_providers, "Push-провайдеры (FCM / APNs / Huawei)", "Доставка push-уведомлений на мобильные устройства")
+System_Ext(yandex_pay, "Яндекс Пэй", "Платёжный шлюз для приёма платежей")
+System_Ext(yandex_maps, "Яндекс Карты", "Картографический сервис: геокодирование, маршруты, ETA")
+System_Ext(bank_api, "Bank API", "Банковский API для выплат водителям")
+
+' === USERS → APPS ===
+Rel(passenger, app_passenger, "Заказывает поездки", "OIDC")
+Rel(passenger, web_frontend, "Заказывает через веб", "OIDC")
+Rel(driver, app_driver, "Работает", "OIDC")
+Rel(manager, web_corp, "Управляет поездками и счетами", "OIDC")
+Rel(accountant, web_admin, "Контролирует выплаты", "OIDC")
+
+' === APPS → KONG ===
+Rel(app_passenger, gateway, "Запросы к BFF Passenger", "HTTPS / OIDC")
+Rel(app_driver, gateway, "Запросы к BFF Driver", "HTTPS / OIDC")
+Rel(web_corp, gateway, "Запросы к BFF Corporate", "HTTPS / OIDC")
+Rel(web_admin, gateway, "Запросы к BFF Admin", "HTTPS / OIDC")
+Rel(web_frontend, gateway, "Запросы к BFF Web", "HTTPS / OIDC")
+
+' === KONG → BFF ===
+Rel(gateway, bff_passenger, "Маршрутизация /bff/passenger/*", "REST")
+Rel(gateway, bff_driver, "Маршрутизация /bff/driver/*", "REST")
+Rel(gateway, bff_corp, "Маршрутизация /bff/corp/*", "REST")
+Rel(gateway, bff_admin, "Маршрутизация /bff/admin/*", "REST")
+Rel(gateway, bff_web, "Маршрутизация /bff/web/*", "REST")
+
+' === BFF → SERVICES ===
+Rel(bff_passenger, svc_booking, "Создание / отмена поездки", "REST")
+Rel(bff_passenger, svc_pricing, "Запрос цены", "REST")
+Rel(bff_passenger, svc_geography, "Адрес и маршрут", "REST")
+Rel(bff_passenger, svc_payments, "Инициация платежа", "REST")
+
+Rel(bff_driver, svc_driver_profile, "Профиль", "REST")
+Rel(bff_driver, svc_driver_status, "Статус и геопозиция", "REST")
+Rel(bff_driver, svc_booking, "Принятие / завершение", "REST")
+Rel(bff_driver, svc_payouts, "Заработок", "REST")
+
+Rel(bff_corp, svc_booking, "Корпоративные поездки", "REST")
+Rel(bff_corp, svc_payments, "Счета и платежи", "REST")
+Rel(bff_corp, svc_analytics, "Отчёты", "REST")
+
+Rel(bff_admin, svc_tenant, "Тенанты", "REST")
+Rel(bff_admin, svc_identity, "Пользователи и роли", "REST")
+Rel(bff_admin, svc_payouts, "Выплаты", "REST")
+Rel(bff_admin, svc_fraud, "Правила fraud", "REST")
+
+Rel(bff_web, svc_booking, "Создание поездки", "REST")
+Rel(bff_web, svc_pricing, "Цена", "REST")
+Rel(bff_web, svc_geography, "Адрес и маршрут", "REST")
+Rel(bff_web, svc_payments, "Платёж", "REST")
+
+' === SERVICES → OWN DB ===
+Rel(svc_booking, db_booking, "R/W", "SQL / ORM")
+Rel(svc_driver_profile, db_driver_profile, "R/W", "SQL / ORM")
+Rel(svc_driver_status, db_driver_status, "R/W", "Redis / PostGIS")
+Rel(svc_pricing, db_pricing, "R/W", "SQL / Redis")
+Rel(svc_payments, db_payments, "R/W", "SQL / ORM")
+Rel(svc_payouts, db_payouts, "R/W", "SQL / ORM")
+Rel(svc_notification, db_notification, "R/W", "SQL / ORM")
+Rel(svc_geography, db_geography, "R/W", "PostGIS / ES")
+Rel(svc_analytics, db_analytics, "R/W", "SQL / ORM")
+Rel(svc_fraud, db_fraud, "R/W", "SQL / ORM")
+Rel(svc_identity, db_identity, "R/W", "SQL / ORM")
+Rel(svc_tenant, db_tenant, "R/W", "SQL / ORM")
+
+' === EVENT BUS ===
+Rel(svc_booking, kafka, "Publish: BookingCreated, BookingCompleted", "Kafka")
+Rel(svc_driver_status, kafka, "Publish: DriverAssigned, DriverStatusChanged, DriverLocationUpdated; Subscribe: BookingCreated", "Kafka")
+Rel(svc_pricing, kafka, "Publish: PriceCalculated; Subscribe: BookingCreated", "Kafka")
+Rel(svc_payments, kafka, "Publish: PaymentSucceeded / Failed", "Kafka")
+Rel(svc_payouts, kafka, "Publish: PayoutCompleted; Subscribe: PaymentSucceeded", "Kafka")
+Rel(svc_notification, kafka, "Subscribe: все доменные события", "Kafka")
+Rel(svc_analytics, kafka, "Subscribe: все доменные события", "Kafka")
+Rel(svc_fraud, kafka, "Publish: FraudAlert; Subscribe: платежи и поездки", "Kafka")
+
+' === EXTERNAL ===
+Rel(svc_notification, push_providers, "Push iOS / Android / Huawei", "REST / HTTPS")
+Rel(svc_payments, yandex_pay, "Платёж, возврат", "REST / HTTPS")
+Rel(svc_payouts, bank_api, "Выплата водителю", "REST / HTTPS")
+Rel(svc_geography, yandex_maps, "Геокодирование, маршруты", "REST / HTTPS")
+
+' === OBSERVABILITY ===
+Rel(business, otel, "Traces / Metrics / Logs от всех бизнес-сервисов", "OTLP")
+Rel(bff_passenger, otel, "Traces / Metrics / Logs", "OTLP")
+Rel(otel, prometheus, "Метрики", "Remote Write")
+Rel(otel, loki, "Логи", "Loki Push API")
+Rel(prometheus, grafana, "Данные для дашбордов", "PromQL")
+Rel(loki, grafana, "Логи для дашбордов", "LogQL")
+Rel(prometheus, alertmanager, "Алерты", "Webhook")
+
+' === CI/CD ===
+Rel(gitlab, registry, "Публикация образов", "Docker Push")
+
+' === DATA PLATFORM ===
+Rel(kafka, spark, "Поток событий", "Kafka Consumer")
+Rel(spark, clickhouse, "Запись агрегатов", "JDBC")
+Rel(clickhouse, ml, "Данные для обучения", "SQL")
+Rel(clickhouse, bi, "Данные для отчётов", "SQL")
+
+' === IDENTITY ===
+Rel(svc_identity, keycloak, "Управление пользователями", "Admin API")
+Rel(bff_passenger, keycloak, "Валидация JWT", "OIDC")
+Rel(bff_driver, keycloak, "Валидация JWT", "OIDC")
+Rel(bff_corp, keycloak, "Валидация JWT", "OIDC")
+Rel(bff_admin, keycloak, "Валидация JWT", "OIDC")
+Rel(bff_web, keycloak, "Валидация JWT", "OIDC")
+
+' === FEATURE FLAGS ===
+Rel(bff_passenger, ff, "Чтение флагов", "REST")
+Rel(bff_driver, ff, "Чтение флагов", "REST")
+Rel(bff_corp, ff, "Чтение флагов", "REST")
+Rel(bff_admin, ff, "Чтение флагов", "REST")
+Rel(bff_web, ff, "Чтение флагов", "REST")
+
+Rel(ml, svc_pricing, "Деплой ML-модели прогнозирования спроса", "Model Registry")
+Rel(ml, svc_fraud, "Деплой ML-модели детекции фрода", "Model Registry")
+
+@enduml
